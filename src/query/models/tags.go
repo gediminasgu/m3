@@ -306,7 +306,11 @@ func (t Tags) TagsWithKeys(includeKeys [][]byte) Tags {
 
 // WithoutName copies the tags excluding the name tag.
 func (t Tags) WithoutName() Tags {
-	return t.TagsWithoutKeys([][]byte{t.Opts.MetricName()})
+	if t.Opts != nil {
+		return t.TagsWithoutKeys([][]byte{t.Opts.MetricName()})
+	} else {
+		return t.TagsWithoutKeys([][]byte{})
+	}
 }
 
 // Get returns the value for the tag with the given name.
