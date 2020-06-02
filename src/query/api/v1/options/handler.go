@@ -175,6 +175,9 @@ type HandlerOptions interface {
 	DefaultQueryEngine() QueryEngine
 	// SetDefaultQueryEngine returns the default query engine.
 	SetDefaultQueryEngine(value QueryEngine) HandlerOptions
+
+	// DefaultQueryEngine returns the default query engine.
+	AutoRouter() config.QueryAutoRouterConfiguration
 }
 
 // HandlerOptions represents handler options.
@@ -199,6 +202,7 @@ type handlerOptions struct {
 	placementServiceNames []string
 	serviceOptionDefaults []handleroptions.ServiceOptionsDefault
 	nowFn                 clock.NowFn
+	autoRouter            config.QueryAutoRouterConfiguration
 }
 
 // EmptyHandlerOptions returns  default handler options.
@@ -257,6 +261,7 @@ func NewHandlerOptions(
 		timeoutOpts: &prometheus.TimeoutOpts{
 			FetchTimeout: timeout,
 		},
+		autoRouter:            cfg.Query.AutoRouter,
 	}, nil
 }
 
@@ -477,4 +482,8 @@ func IsQueryEngineSet(v string) bool {
 		return true
 	}
 	return false
+}
+
+func (o *handlerOptions) AutoRouter() config.QueryAutoRouterConfiguration {
+	return o.autoRouter
 }

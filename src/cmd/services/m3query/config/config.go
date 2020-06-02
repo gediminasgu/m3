@@ -210,6 +210,13 @@ type QueryConfiguration struct {
 	Timeout       *time.Duration               `yaml:"timeout"`
 	DefaultEngine string                       `yaml:"defaultEngine"`
 	Prometheus    PrometheusQueryConfiguration `yaml:"prometheus"`
+	AutoRouter    QueryAutoRouterConfiguration `yaml:"autorouter"`
+}
+
+// QueryAutoRouterConfiguration is query auto-router configuration.
+type QueryAutoRouterConfiguration struct {
+	Enabled  bool `yaml:"enabled"`
+	LogStats bool `yaml:"logStats"`
 }
 
 // TimeoutOrDefault returns the configured timeout or default value.

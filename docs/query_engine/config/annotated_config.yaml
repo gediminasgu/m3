@@ -88,3 +88,9 @@ query:
   timeout: <duration>
   # The default query engine is 'prometheus' but it could be switched to 'm3query'
   defaultEngine: <string>
+  # auto router which redirects queries between promql and m3query automatically based on some rules
+  autorouter:
+    # Enable or disable auto routing. By default it's disabled.
+    enabled: <bool>
+    # Log stats about queries executed, which engine was used and how long it took. By default it's disabled.
+    logStats: <bool>
