@@ -30,6 +30,7 @@ import (
 	"github.com/m3db/m3/src/dbnode/encoding/m3tsz"
 	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/dbnode/persist"
+	"github.com/m3db/m3/src/dbnode/storage/block"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
 	"github.com/m3db/m3/src/x/checked"
@@ -462,7 +463,7 @@ func testMergeWith(
 		BlockStart: startTime,
 	}
 	mergeWith := mockMergeWithFromData(t, ctrl, diskData, mergeTargetData)
-	err := merger.Merge(fsID, mergeWith, 1, preparer, nsCtx)
+	err := merger.Merge(fsID, mergeWith, 1, preparer, nsCtx, &persist.NoOpColdFlushNamespace{})
 	require.NoError(t, err)
 
 	assertPersistedAsExpected(t, persisted, expectedData)
@@ -480,7 +481,7 @@ func assertPersistedAsExpected(
 		id := actualData.id
 		data, exists := expectedData.Get(id)
 		require.True(t, exists)
-		seg := ts.NewSegment(data, nil, ts.FinalizeHead)
+		seg := ts.NewSegment(data, nil, 0, ts.FinalizeHead)
 
 		expectedDPs := datapointsFromSegment(t, seg)
 		actualDPs := datapointsFromSegment(t, actualData.segment)
@@ -587,7 +588,10 @@ func mockMergeWithFromData(
 				data, ok := mergeTargetData.Get(id)
 				if ok {
 					segReader := srPool.Get()
-					br := []xio.BlockReader{blockReaderFromData(data, segReader, startTime, blockSize)}
+					br := block.FetchBlockResult{
+						Start:  startTime,
+						Blocks: []xio.BlockReader{blockReaderFromData(data, segReader, startTime, blockSize)},
+					}
 					fn(id, ident.Tags{}, br)
 				}
 			}
@@ -624,7 +628,7 @@ func blockReaderFromData(
 	startTime time.Time,
 	blockSize time.Duration,
 ) xio.BlockReader {
-	seg := ts.NewSegment(data, nil, ts.FinalizeHead)
+	seg := ts.NewSegment(data, nil, 0, ts.FinalizeHead)
 	segReader.Reset(seg)
 	return xio.BlockReader{
 		SegmentReader: segReader,

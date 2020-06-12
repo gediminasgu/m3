@@ -31,11 +31,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
-	"github.com/m3db/m3/src/x/instrument"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -218,22 +218,37 @@ func (r results) Less(i, j int) bool {
 	return strings.Compare(r[i].ID, r[j].ID) == -1
 }
 
-func testFind(t *testing.T, ex bool, ex2 bool, header string) {
+func testFind(t *testing.T, httpMethod string, ex bool, ex2 bool, header string) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	// setup storage and handler
 	store := setupStorage(ctrl, ex, ex2)
-	h := NewFindHandler(store,
-		handler.NewFetchOptionsBuilder(handler.FetchOptionsBuilderOptions{}),
-		instrument.NewOptions())
+
+	builder := handleroptions.
+		NewFetchOptionsBuilder(handleroptions.FetchOptionsBuilderOptions{})
+	opts := options.EmptyHandlerOptions().
+		SetFetchOptionsBuilder(builder).
+		SetStorage(store)
+	h := NewFindHandler(opts)
 
 	// execute the query
+	params := make(url.Values)
+	params.Set("query", "foo.b*")
+	params.Set("from", from.s)
+	params.Set("until", until.s)
+
 	w := &writer{}
 	req := &http.Request{
-		URL: &url.URL{
-			RawQuery: fmt.Sprintf("query=foo.b*&from=%s&until=%s", from.s, until.s),
-		},
+		Method: httpMethod,
+	}
+	switch httpMethod {
+	case http.MethodGet:
+		req.URL = &url.URL{
+			RawQuery: params.Encode(),
+		}
+	case http.MethodPost:
+		req.Form = params
 	}
 
 	h.ServeHTTP(w, req)
@@ -257,13 +272,15 @@ func testFind(t *testing.T, ex bool, ex2 bool, header string) {
 
 	expected := results{
 		makeNoChildrenResult("bar"),
+		makeNoChildrenResult("baz"),
 		makeWithChildrenResult("baz"),
 		makeWithChildrenResult("bix"),
+		makeNoChildrenResult("bug"),
 		makeWithChildrenResult("bug"),
 	}
 
 	require.Equal(t, expected, r)
-	actual := w.Header().Get(handler.LimitHeader)
+	actual := w.Header().Get(handleroptions.LimitHeader)
 	assert.Equal(t, header, actual)
 }
 
@@ -273,17 +290,19 @@ var limitTests = []struct {
 	header  string
 }{
 	{"both incomplete", false, false, fmt.Sprintf(
-		"%s,%s_%s", handler.LimitHeaderSeriesLimitApplied, "foo", "bar")},
+		"%s,%s_%s", handleroptions.LimitHeaderSeriesLimitApplied, "foo", "bar")},
 	{"with terminator incomplete", true, false, "foo_bar"},
 	{"with children incomplete", false, true,
-		handler.LimitHeaderSeriesLimitApplied},
+		handleroptions.LimitHeaderSeriesLimitApplied},
 	{"both complete", true, true, ""},
 }
 
 func TestFind(t *testing.T) {
 	for _, tt := range limitTests {
 		t.Run(tt.name, func(t *testing.T) {
-			testFind(t, tt.ex, tt.ex2, tt.header)
+			for _, httpMethod := range FindHTTPMethods {
+				testFind(t, httpMethod, tt.ex, tt.ex2, tt.header)
+			}
 		})
 	}
 }

@@ -74,7 +74,7 @@ func generateOptionsNowAndBlockSize() (Options, time.Time, time.Duration) {
 func setupForwardIndex(
 	t *testing.T,
 	ctrl *gomock.Controller,
-) (namespaceIndex, time.Time, time.Duration) {
+) (NamespaceIndex, time.Time, time.Duration) {
 	newFn := func(
 		fn nsIndexInsertBatchFn,
 		md namespace.Metadata,
@@ -419,7 +419,7 @@ func writeToShard(
 func verifyShard(
 	ctx context.Context,
 	t *testing.T,
-	idx namespaceIndex,
+	idx NamespaceIndex,
 	now time.Time,
 	next time.Time,
 	id string,
@@ -465,7 +465,7 @@ func writeToShardAndVerify(
 	ctx context.Context,
 	t *testing.T,
 	shard *dbShard,
-	idx namespaceIndex,
+	idx NamespaceIndex,
 	now time.Time,
 	next time.Time,
 	id string,
@@ -479,10 +479,10 @@ func testShardForwardWriteTaggedSyncRefCount(
 	t *testing.T,
 	now time.Time,
 	next time.Time,
-	idx namespaceIndex,
+	idx NamespaceIndex,
 	opts Options,
 ) {
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().
 		SetWriteNewSeriesAsync(false))
 	defer shard.Close()
@@ -524,7 +524,7 @@ func testShardForwardWriteTaggedAsyncRefCount(
 	t *testing.T,
 	now time.Time,
 	next time.Time,
-	idx namespaceIndex,
+	idx NamespaceIndex,
 	opts Options,
 ) {
 	testReporterOpts := xmetrics.NewTestStatsReporterOptions()
@@ -538,7 +538,7 @@ func testShardForwardWriteTaggedAsyncRefCount(
 			SetMetricsScope(scope).
 			SetReportInterval(100 * time.Millisecond))
 
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().
 		SetWriteNewSeriesAsync(true))
 	defer shard.Close()

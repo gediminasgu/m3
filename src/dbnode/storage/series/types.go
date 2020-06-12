@@ -38,6 +38,17 @@ import (
 	"github.com/uber-go/tally"
 )
 
+// DatabaseSeriesOptions is a set of options for creating a database series.
+type DatabaseSeriesOptions struct {
+	ID                     ident.ID
+	Tags                   ident.Tags
+	UniqueIndex            uint64
+	BlockRetriever         QueryableBlockRetriever
+	OnRetrieveBlock        block.OnRetrieveBlock
+	OnEvictedFromWiredList block.OnEvictedFromWiredList
+	Options                Options
+}
+
 // DatabaseSeries is a series in the database.
 type DatabaseSeries interface {
 	block.OnRetrieveBlock
@@ -48,6 +59,10 @@ type DatabaseSeries interface {
 
 	// Tags return the tags of the series.
 	Tags() ident.Tags
+
+	// UniqueIndex is the unique index for the series (for this current
+	// process, unless the time series expires).
+	UniqueIndex() uint64
 
 	// Tick executes async updates
 	Tick(blockStates ShardBlockStateSnapshot, nsCtx namespace.Context) (TickResult, error)
@@ -60,7 +75,7 @@ type DatabaseSeries interface {
 		unit xtime.Unit,
 		annotation []byte,
 		wOpts WriteOptions,
-	) (bool, error)
+	) (bool, WriteType, error)
 
 	// ReadEncoded reads encoded blocks.
 	ReadEncoded(
@@ -84,7 +99,7 @@ type DatabaseSeries interface {
 		start time.Time,
 		version int,
 		nsCtx namespace.Context,
-	) ([]xio.BlockReader, error)
+	) (block.FetchBlockResult, error)
 
 	// FetchBlocksMetadata returns the blocks metadata.
 	FetchBlocksMetadata(
@@ -99,15 +114,11 @@ type DatabaseSeries interface {
 	// NumActiveBlocks returns the number of active blocks the series currently holds.
 	NumActiveBlocks() int
 
-	// IsBootstrapped returns whether the series is bootstrapped or not.
-	IsBootstrapped() bool
-
-	// Load loads data into the series.
-	Load(
-		opts LoadOptions,
-		blocks block.DatabaseSeriesBlocks,
-		blockStates BootstrappedBlockStateSnapshot,
-	) (LoadResult, error)
+	/// LoadBlock loads a single block into the series.
+	LoadBlock(
+		block block.DatabaseBlock,
+		writeType WriteType,
+	) error
 
 	// WarmFlush flushes the WarmWrites of this series for a given start time.
 	WarmFlush(
@@ -133,14 +144,7 @@ type DatabaseSeries interface {
 	Close()
 
 	// Reset resets the series for reuse.
-	Reset(
-		id ident.ID,
-		tags ident.Tags,
-		blockRetriever QueryableBlockRetriever,
-		onRetrieveBlock block.OnRetrieveBlock,
-		onEvictedFromWiredList block.OnEvictedFromWiredList,
-		opts Options,
-	)
+	Reset(opts DatabaseSeriesOptions)
 }
 
 // FetchBlocksMetadataOptions encapsulates block fetch metadata options
@@ -403,26 +407,23 @@ type WriteOptions struct {
 	TruncateType TruncateType
 	// TransformOptions describes transformation options for incoming writes.
 	TransformOptions WriteTransformOptions
-}
-
-// LoadOptions contains the options for the Load() method.
-type LoadOptions struct {
-	// Whether the call to Bootstrap should be considered a "true" bootstrap
-	// or if additional data is being loaded after the fact (as in the case
-	// of repairs).
-	Bootstrap bool
-}
-
-// LoadResult contains the return information for the Load() method.
-type LoadResult struct {
-	Bootstrap BootstrapResult
-}
-
-// BootstrapResult contains information about the result of bootstrapping a series.
-// It is returned from the series Bootstrap method primarily so the caller can aggregate
-// and emit metrics instead of the series itself having to store additional fields (which
-// would be costly because we have millions of them.)
-type BootstrapResult struct {
-	NumBlocksMovedToBuffer int64
-	NumBlocksMerged        int64
+	// MatchUniqueIndex specifies whether the series unique index
+	// must match the unique index value specified (to ensure the series
+	// being written is the same series as previously referenced).
+	MatchUniqueIndex bool
+	// MatchUniqueIndexValue is the series unique index value that
+	// must match the current series unique index value (to ensure series
+	// being written is the same series as previously referenced).
+	MatchUniqueIndexValue uint64
+	// BootstrapWrite allows a warm write outside the time window as long as the
+	// block hasn't already been flushed to disk. This is useful for
+	// bootstrappers filling data that they know has not yet been flushed to
+	// disk.
+	BootstrapWrite bool
+	// SkipOutOfRetention allows for skipping writes that are out of retention
+	// by just returning success, this allows for callers to not have to
+	// deal with clock skew when they are trying to write a value that may not
+	// fall into retention but they do not care if it fails to write due to
+	// it just having fallen out of retention (time race).
+	SkipOutOfRetention bool
 }

@@ -76,12 +76,10 @@ type aggProcessor struct {
 
 func (a aggProcessor) initialize(
 	_ time.Duration,
-	controller *transform.Controller,
 	opts transform.Options,
 ) processor {
 	return &aggNode{
-		controller: controller,
-		aggFunc:    a.aggFunc,
+		aggFunc: a.aggFunc,
 	}
 }
 
@@ -137,12 +135,13 @@ func NewAggOp(args []interface{}, optype string) (transform.Params, error) {
 }
 
 type aggNode struct {
-	controller *transform.Controller
-	aggFunc    func([]float64) float64
+	values  []float64
+	aggFunc func([]float64) float64
 }
 
 func (a *aggNode) process(datapoints ts.Datapoints, _ iterationBounds) float64 {
-	return a.aggFunc(datapoints.Values())
+	a.values = datapoints.Reset(a.values)
+	return a.aggFunc(a.values)
 }
 
 func avgOverTime(values []float64) float64 {

@@ -30,13 +30,14 @@ import (
 )
 
 const (
-	// ResetsType returns the number of counter resets within the provided time range as a time series.
-	// Any decrease in the value between two consecutive datapoints is interpreted as a counter reset.
+	// ResetsType returns the number of counter resets within the provided time
+	// range as a time series. Any decrease in the value between two consecutive
+	// datapoints is interpreted as a counter reset.
 	// ResetsTemporalType should only be used with counters.
 	ResetsType = "resets"
 
-	// ChangesType returns the number of times a value changes within the provided time range for
-	// a given time series.
+	// ChangesType returns the number of times a value changes within the
+	// provided time range for a given time series.
 	ChangesType = "changes"
 )
 
@@ -48,11 +49,9 @@ type functionProcessor struct {
 
 func (f functionProcessor) initialize(
 	_ time.Duration,
-	controller *transform.Controller,
-	opts transform.Options,
+	_ transform.Options,
 ) processor {
-	return &functionNode{
-		controller:     controller,
+	return &functionNode{ 
 		comparisonFunc: f.compFunc,
 	}
 }
@@ -72,7 +71,8 @@ func NewFunctionOp(args []interface{}, optype string) (transform.Params, error) 
 
 	duration, ok := args[0].(time.Duration)
 	if !ok {
-		return emptyOp, fmt.Errorf("unable to cast to scalar argument: %v for %s", args[0], optype)
+		return emptyOp, fmt.
+			Errorf("unable to cast to scalar argument: %v for %s", args[0], optype)
 	}
 
 	f := functionProcessor{
@@ -82,8 +82,7 @@ func NewFunctionOp(args []interface{}, optype string) (transform.Params, error) 
 	return newBaseOp(duration, optype, f)
 }
 
-type functionNode struct {
-	controller     *transform.Controller
+type functionNode struct { 
 	comparisonFunc comparisonFunc
 }
 

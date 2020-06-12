@@ -45,7 +45,7 @@ var (
 // the WriteBatch method.
 type DownsampleAndWriteIter interface {
 	Next() bool
-	Current() (models.Tags, ts.Datapoints, xtime.Unit, []byte)
+	Current() (models.Tags, ts.Datapoints, ts.SeriesAttributes, xtime.Unit, []byte)
 	Reset() error
 	Error() error
 }
@@ -81,7 +81,7 @@ type BatchError interface {
 // WriteOptions contains overrides for the downsampling mapping
 // rules and storage policies for a given write.
 type WriteOptions struct {
-	DownsampleMappingRules []downsample.MappingRule
+	DownsampleMappingRules []downsample.AutoMappingRule
 	WriteStoragePolicies   []policy.StoragePolicy
 
 	DownsampleOverride bool
@@ -182,7 +182,7 @@ func (d *downsamplerAndWriter) shouldDownsample(
 
 func (d *downsamplerAndWriter) downsampleOverrideRules(
 	overrides WriteOptions,
-) ([]downsample.MappingRule, bool) {
+) ([]downsample.AutoMappingRule, bool) {
 	downsampleOverride := overrides.DownsampleOverride && len(overrides.DownsampleMappingRules) > 0
 	if !downsampleOverride {
 		return nil, false
@@ -216,6 +216,10 @@ func (d *downsamplerAndWriter) writeToDownsampler(
 		// through the downsampler in general, but right now the aggregator
 		// does not allow context to be attached to a metric so when it calls
 		// back the context is lost currently.
+		// TODO_FIX_GRAPHITE_TAGGING: Using this string constant to track
+		// all places worth fixing this hack. There is at least one
+		// other path where flows back to the coordinator from the aggregator
+		// and this tag is interpreted, eventually need to handle more cleanly.
 		appender.AddTag(downsample.MetricsOptionIDSchemeTagName,
 			downsample.GraphiteIDSchemeTagValue)
 	}
@@ -255,7 +259,7 @@ func (d *downsamplerAndWriter) writeToStorage(
 ) error {
 	storagePolicies, ok := d.writeOverrideStoragePolicies(overrides)
 	if !ok {
-		return d.store.Write(ctx, &storage.WriteQuery{
+		return d.writeWithOptions(ctx, storage.WriteQueryOptions{
 			Tags:       tags,
 			Datapoints: datapoints,
 			Unit:       unit,
@@ -275,7 +279,7 @@ func (d *downsamplerAndWriter) writeToStorage(
 
 		wg.Add(1)
 		d.workerPool.Go(func() {
-			err := d.store.Write(ctx, &storage.WriteQuery{
+			err := d.writeWithOptions(ctx, storage.WriteQueryOptions{
 				Tags:       tags,
 				Datapoints: datapoints,
 				Unit:       unit,
@@ -293,6 +297,17 @@ func (d *downsamplerAndWriter) writeToStorage(
 
 	wg.Wait()
 	return multiErr.FinalError()
+}
+
+func (d *downsamplerAndWriter) writeWithOptions(
+	ctx context.Context,
+	opts storage.WriteQueryOptions,
+) error {
+	writeQuery, err := storage.NewWriteQuery(opts)
+	if err != nil {
+		return err
+	}
+	return d.store.Write(ctx, writeQuery)
 }
 
 func (d *downsamplerAndWriter) WriteBatch(
@@ -321,12 +336,12 @@ func (d *downsamplerAndWriter) WriteBatch(
 		}
 
 		for iter.Next() {
-			tags, datapoints, unit, annotation := iter.Current()
+			tags, datapoints, _, unit, annotation := iter.Current()
 			for _, p := range storagePolicies {
 				p := p // Capture for lambda.
 				wg.Add(1)
 				d.workerPool.Go(func() {
-					err := d.store.Write(ctx, &storage.WriteQuery{
+					err := d.writeWithOptions(ctx, storage.WriteQueryOptions{
 						Tags:       tags,
 						Datapoints: datapoints,
 						Unit:       unit,
@@ -376,7 +391,7 @@ func (d *downsamplerAndWriter) writeAggregatedBatch(
 
 	for iter.Next() {
 		appender.Reset()
-		tags, datapoints, _, _ := iter.Current()
+		tags, datapoints, info, _, _ := iter.Current()
 		for _, tag := range tags.Tags {
 			appender.AddTag(tag.Name, tag.Value)
 		}
@@ -397,7 +412,14 @@ func (d *downsamplerAndWriter) writeAggregatedBatch(
 		}
 
 		for _, dp := range datapoints {
-			err := samplesAppender.AppendGaugeTimedSample(dp.Timestamp, dp.Value)
+			switch info.Type {
+			case ts.MetricTypeGauge:
+				err = samplesAppender.AppendGaugeTimedSample(dp.Timestamp, dp.Value)
+			case ts.MetricTypeCounter:
+				err = samplesAppender.AppendCounterTimedSample(dp.Timestamp, int64(dp.Value))
+			case ts.MetricTypeTimer:
+				err = samplesAppender.AppendTimerTimedSample(dp.Timestamp, dp.Value)
+			}
 			if err != nil {
 				return err
 			}

@@ -92,17 +92,6 @@ func newEncodedBlock(
 	}
 }
 
-func (b *encodedBlock) Unconsolidated() (block.UnconsolidatedBlock, error) {
-	return &encodedBlockUnconsolidated{
-		lastBlock:            b.lastBlock,
-		meta:                 b.meta,
-		consolidation:        b.consolidation,
-		seriesMetas:          b.seriesMetas,
-		seriesBlockIterators: b.seriesBlockIterators,
-		options:              b.options,
-	}, nil
-}
-
 func (b *encodedBlock) Close() error {
 	for _, bl := range b.seriesBlockIterators {
 		bl.Close()

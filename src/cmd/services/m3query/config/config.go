@@ -30,8 +30,7 @@ import (
 	ingestm3msg "github.com/m3db/m3/src/cmd/services/m3coordinator/ingest/m3msg"
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/server/m3msg"
 	"github.com/m3db/m3/src/metrics/aggregation"
-	"github.com/m3db/m3/src/query/api/v1/handler"
-	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/remote"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/query/graphite/graphite"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
@@ -53,11 +52,20 @@ const (
 	GRPCStorageType BackendStorageType = "grpc"
 	// M3DBStorageType is for m3db backend.
 	M3DBStorageType BackendStorageType = "m3db"
+	// NoopEtcdStorageType is for a noop backend which returns empty results for
+	// any query and blackholes any writes, but requires that a valid etcd cluster
+	// is defined and can be connected to. Primarily used for standalone
+	// coordinators used only to serve m3admin APIs.
+	NoopEtcdStorageType BackendStorageType = "noop-etcd"
 
 	defaultCarbonIngesterListenAddress = "0.0.0.0:7204"
 	errNoIDGenerationScheme            = "error: a recent breaking change means that an ID " +
 		"generation scheme is required in coordinator configuration settings. " +
 		"More information is available here: %s"
+
+	defaultQueryTimeout = 30 * time.Second
+
+	defaultPrometheusMaxSamplesPerQuery = 100000000
 )
 
 var (
@@ -125,6 +133,9 @@ type Configuration struct {
 	// Carbon is the carbon configuration.
 	Carbon *CarbonConfiguration `yaml:"carbon"`
 
+	// Query is the query configuration.
+	Query QueryConfiguration `yaml:"query"`
+
 	// Limits specifies limits on per-query resource usage.
 	Limits LimitsConfiguration `yaml:"limits"`
 
@@ -145,11 +156,14 @@ type Configuration struct {
 	// stanza not able to startup the binary since we parse YAML in strict mode
 	// by default).
 	DeprecatedCache CacheConfiguration `yaml:"cache"`
+
+	// MultiProcess is the multi-process configuration.
+	MultiProcess MultiProcessConfiguration `yaml:"multiProcess"`
 }
 
 // WriteForwardingConfiguration is the write forwarding configuration.
 type WriteForwardingConfiguration struct {
-	PromRemoteWrite remote.PromWriteHandlerForwardingOptions `yaml:"promRemoteWrite"`
+	PromRemoteWrite handleroptions.PromWriteHandlerForwardingOptions `yaml:"promRemoteWrite"`
 }
 
 // Filter is a query filter type.
@@ -191,11 +205,40 @@ type ResultOptions struct {
 	KeepNans bool `yaml:"keepNans"`
 }
 
+// QueryConfiguration is the query configuration.
+type QueryConfiguration struct {
+	Timeout       *time.Duration               `yaml:"timeout"`
+	DefaultEngine string                       `yaml:"defaultEngine"`
+	Prometheus    PrometheusQueryConfiguration `yaml:"prometheus"`
+}
+
+// TimeoutOrDefault returns the configured timeout or default value.
+func (c QueryConfiguration) TimeoutOrDefault() time.Duration {
+	if v := c.Timeout; v != nil {
+		return *v
+	}
+	return defaultQueryTimeout
+}
+
+// PrometheusQueryConfiguration is the prometheus query engine configuration.
+type PrometheusQueryConfiguration struct {
+	// MaxSamplesPerQuery is the limit on fetched samples per query.
+	MaxSamplesPerQuery *int `yaml:"maxSamplesPerQuery"`
+}
+
+// MaxSamplesPerQueryOrDefault returns the max samples per query or default.
+func (c PrometheusQueryConfiguration) MaxSamplesPerQueryOrDefault() int {
+	if v := c.MaxSamplesPerQuery; v != nil {
+		return *v
+	}
+	return defaultPrometheusMaxSamplesPerQuery
+}
+
 // LimitsConfiguration represents limitations on resource usage in the query
 // instance. Limits are split between per-query and global limits.
 type LimitsConfiguration struct {
 	// deprecated: use PerQuery.MaxComputedDatapoints instead.
-	DeprecatedMaxComputedDatapoints int64 `yaml:"maxComputedDatapoints"`
+	DeprecatedMaxComputedDatapoints int `yaml:"maxComputedDatapoints"`
 
 	// Global configures limits which apply across all queries running on this
 	// instance.
@@ -210,7 +253,7 @@ type LimitsConfiguration struct {
 // LimitsConfiguration.PerQuery.PrivateMaxComputedDatapoints. See
 // LimitsConfiguration.PerQuery.PrivateMaxComputedDatapoints for a comment on
 // the semantics.
-func (lc *LimitsConfiguration) MaxComputedDatapoints() int64 {
+func (lc LimitsConfiguration) MaxComputedDatapoints() int {
 	if lc.PerQuery.PrivateMaxComputedDatapoints != 0 {
 		return lc.PerQuery.PrivateMaxComputedDatapoints
 	}
@@ -223,7 +266,7 @@ func (lc *LimitsConfiguration) MaxComputedDatapoints() int64 {
 type GlobalLimitsConfiguration struct {
 	// MaxFetchedDatapoints limits the total number of datapoints actually
 	// fetched by all queries at any given time.
-	MaxFetchedDatapoints int64 `yaml:"maxFetchedDatapoints"`
+	MaxFetchedDatapoints int `yaml:"maxFetchedDatapoints"`
 }
 
 // AsLimitManagerOptions converts this configuration to
@@ -242,14 +285,14 @@ type PerQueryLimitsConfiguration struct {
 	// N.B.: the hacky "Private" prefix is to indicate that callers should use
 	// LimitsConfiguration.MaxComputedDatapoints() instead of accessing
 	// this field directly.
-	PrivateMaxComputedDatapoints int64 `yaml:"maxComputedDatapoints"`
+	PrivateMaxComputedDatapoints int `yaml:"maxComputedDatapoints"`
 
 	// MaxFetchedDatapoints limits the number of datapoints actually used by a
 	// given query.
-	MaxFetchedDatapoints int64 `yaml:"maxFetchedDatapoints"`
+	MaxFetchedDatapoints int `yaml:"maxFetchedDatapoints"`
 
 	// MaxFetchedSeries limits the number of time series returned by a storage node.
-	MaxFetchedSeries int64 `yaml:"maxFetchedSeries"`
+	MaxFetchedSeries int `yaml:"maxFetchedSeries"`
 }
 
 // AsLimitManagerOptions converts this configuration to
@@ -260,19 +303,19 @@ func (l *PerQueryLimitsConfiguration) AsLimitManagerOptions() cost.LimitManagerO
 
 // AsFetchOptionsBuilderOptions converts this configuration to
 // handler.FetchOptionsBuilderOptions.
-func (l *PerQueryLimitsConfiguration) AsFetchOptionsBuilderOptions() handler.FetchOptionsBuilderOptions {
+func (l *PerQueryLimitsConfiguration) AsFetchOptionsBuilderOptions() handleroptions.FetchOptionsBuilderOptions {
 	if l.MaxFetchedSeries <= 0 {
-		return handler.FetchOptionsBuilderOptions{
+		return handleroptions.FetchOptionsBuilderOptions{
 			Limit: defaultStorageQueryLimit,
 		}
 	}
 
-	return handler.FetchOptionsBuilderOptions{
+	return handleroptions.FetchOptionsBuilderOptions{
 		Limit: int(l.MaxFetchedSeries),
 	}
 }
 
-func toLimitManagerOptions(limit int64) cost.LimitManagerOptions {
+func toLimitManagerOptions(limit int) cost.LimitManagerOptions {
 	return cost.NewLimitManagerOptions().SetDefaultLimit(cost.Limit{
 		Threshold: cost.Cost(limit),
 		Enabled:   limit > 0,
@@ -372,6 +415,7 @@ func (c *CarbonIngesterConfiguration) RulesOrDefault(namespaces m3.ClusterNamesp
 // ingestion rule.
 type CarbonIngesterRuleConfiguration struct {
 	Pattern     string                                     `yaml:"pattern"`
+	Continue    bool                                       `yaml:"continue"`
 	Aggregation CarbonIngesterAggregationConfiguration     `yaml:"aggregation"`
 	Policies    []CarbonIngesterStoragePolicyConfiguration `yaml:"policies"`
 }
@@ -519,4 +563,21 @@ func TagOptionsFromConfig(cfg TagOptionsConfiguration) (models.TagOptions, error
 // ExperimentalAPIConfiguration is the configuration for the experimental API group.
 type ExperimentalAPIConfiguration struct {
 	Enabled bool `yaml:"enabled"`
+}
+
+// MultiProcessConfiguration is the multi-process configuration which
+// allows running multiple sub-processes of an instance reusing the
+// same listen ports.
+type MultiProcessConfiguration struct {
+	// Enabled is whether to enable multi-process execution.
+	Enabled bool `yaml:"enabled"`
+	// Count is the number of sub-processes to run, leave zero
+	// to auto-detect based on number of CPUs.
+	Count int `yaml:"count" validate:"min=0"`
+	// PerCPU is the factor of processes to run per CPU, leave
+	// zero to use the default of 0.5 per CPU (i.e. one process for
+	// every two CPUs).
+	PerCPU float64 `yaml:"perCPU" validate:"min=0.0, max=0.0"`
+	// GoMaxProcs if set will explicitly set the child GOMAXPROCs env var.
+	GoMaxProcs int `yaml:"goMaxProcs"`
 }

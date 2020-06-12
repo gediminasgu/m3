@@ -22,6 +22,7 @@ package series
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -38,16 +39,16 @@ import (
 	"go.uber.org/zap"
 )
 
-type bootstrapState int
-
-const (
-	bootstrapNotStarted bootstrapState = iota
-	bootstrapped
-)
-
 var (
 	// ErrSeriesAllDatapointsExpired is returned on tick when all datapoints are expired
 	ErrSeriesAllDatapointsExpired = errors.New("series datapoints are all expired")
+	// errSeriesMatchUniqueIndexFailed is returned when MatchUniqueIndex is
+	// specified for a write but the value does not match the current series
+	// unique index.
+	errSeriesMatchUniqueIndexFailed = errors.New("series write failed due to unique index not matched")
+	// errSeriesMatchUniqueIndexInvalid is returned when MatchUniqueIndex is
+	// specified for a write but the current series unique index is invalid.
+	errSeriesMatchUniqueIndexInvalid = errors.New("series write failed due to unique index being invalid")
 
 	errSeriesAlreadyBootstrapped         = errors.New("series is already bootstrapped")
 	errSeriesNotBootstrapped             = errors.New("series is not yet bootstrapped")
@@ -62,26 +63,26 @@ type dbSeries struct {
 	// series ID before changing ownership semantics (e.g.
 	// pooling the ID rather than releasing it to the GC on
 	// calling series.Reset()).
-	id   ident.ID
-	tags ident.Tags
+	id          ident.ID
+	tags        ident.Tags
+	uniqueIndex uint64
 
 	buffer                      databaseBuffer
 	cachedBlocks                block.DatabaseSeriesBlocks
-	bs                          bootstrapState
 	blockRetriever              QueryableBlockRetriever
 	onRetrieveBlock             block.OnRetrieveBlock
 	blockOnEvictedFromWiredList block.OnEvictedFromWiredList
 	pool                        DatabaseSeriesPool
 }
 
-// NewDatabaseSeries creates a new database series
-func NewDatabaseSeries(id ident.ID, tags ident.Tags, opts Options) DatabaseSeries {
+// NewDatabaseSeries creates a new database series.
+func NewDatabaseSeries(opts DatabaseSeriesOptions) DatabaseSeries {
 	s := newDatabaseSeries()
-	s.Reset(id, tags, nil, nil, nil, opts)
+	s.Reset(opts)
 	return s
 }
 
-// newPooledDatabaseSeries creates a new pooled database series
+// newPooledDatabaseSeries creates a new pooled database series.
 func newPooledDatabaseSeries(pool DatabaseSeriesPool) DatabaseSeries {
 	series := newDatabaseSeries()
 	series.pool = pool
@@ -93,7 +94,6 @@ func newPooledDatabaseSeries(pool DatabaseSeriesPool) DatabaseSeries {
 func newDatabaseSeries() *dbSeries {
 	series := &dbSeries{
 		cachedBlocks: block.NewDatabaseSeriesBlocks(0),
-		bs:           bootstrapNotStarted,
 	}
 	series.buffer = newDatabaseBuffer()
 	return series
@@ -116,6 +116,13 @@ func (s *dbSeries) Tags() ident.Tags {
 	tags := s.tags
 	s.RUnlock()
 	return tags
+}
+
+func (s *dbSeries) UniqueIndex() uint64 {
+	s.RLock()
+	uniqueIndex := s.uniqueIndex
+	s.RUnlock()
+	return uniqueIndex
 }
 
 func (s *dbSeries) Tick(blockStates ShardBlockStateSnapshot, nsCtx namespace.Context) (TickResult, error) {
@@ -274,13 +281,6 @@ func (s *dbSeries) NumActiveBlocks() int {
 	return value
 }
 
-func (s *dbSeries) IsBootstrapped() bool {
-	s.RLock()
-	state := s.bs
-	s.RUnlock()
-	return state == bootstrapped
-}
-
 func (s *dbSeries) Write(
 	ctx context.Context,
 	timestamp time.Time,
@@ -288,11 +288,27 @@ func (s *dbSeries) Write(
 	unit xtime.Unit,
 	annotation []byte,
 	wOpts WriteOptions,
-) (bool, error) {
+) (bool, WriteType, error) {
+	var writeType WriteType
 	s.Lock()
-	wasWritten, err := s.buffer.Write(ctx, timestamp, value, unit, annotation, wOpts)
-	s.Unlock()
-	return wasWritten, err
+	defer s.Unlock()
+	matchUniqueIndex := wOpts.MatchUniqueIndex
+	if matchUniqueIndex {
+		if s.uniqueIndex == 0 {
+			return false, writeType, errSeriesMatchUniqueIndexInvalid
+		}
+		if s.uniqueIndex != wOpts.MatchUniqueIndexValue {
+			// NB(r): Match unique index allows for a caller to
+			// reliably take a reference to a series and call Write(...)
+			// later while keeping a direct reference to the series
+			// while the shard and namespace continues to own and manage
+			// the lifecycle of the series.
+			return false, writeType, errSeriesMatchUniqueIndexFailed
+		}
+	}
+
+	wasWritten, writeType, err := s.buffer.Write(ctx, timestamp, value, unit, annotation, wOpts)
+	return wasWritten, writeType, err
 }
 
 func (s *dbSeries) ReadEncoded(
@@ -312,14 +328,14 @@ func (s *dbSeries) FetchBlocksForColdFlush(
 	start time.Time,
 	version int,
 	nsCtx namespace.Context,
-) ([]xio.BlockReader, error) {
+) (block.FetchBlockResult, error) {
 	// This needs a write lock because the version on underlying buckets need
 	// to be modified.
 	s.Lock()
-	br, err := s.buffer.FetchBlocksForColdFlush(ctx, start, version, nsCtx)
+	result, err := s.buffer.FetchBlocksForColdFlush(ctx, start, version, nsCtx)
 	s.Unlock()
 
-	return br, err
+	return result, err
 }
 
 func (s *dbSeries) FetchBlocks(
@@ -373,89 +389,37 @@ func (s *dbSeries) addBlockWithLock(b block.DatabaseBlock) {
 	s.cachedBlocks.AddBlock(b)
 }
 
-func (s *dbSeries) Load(
-	opts LoadOptions,
-	blocksToLoad block.DatabaseSeriesBlocks,
-	blockStates BootstrappedBlockStateSnapshot,
-) (LoadResult, error) {
-	if opts.Bootstrap {
-		bsResult, err := s.bootstrap(blocksToLoad, blockStates)
-		return LoadResult{Bootstrap: bsResult}, err
+func (s *dbSeries) LoadBlock(
+	block block.DatabaseBlock,
+	writeType WriteType,
+) error {
+	switch writeType {
+	case WarmWrite:
+		at := block.StartTime()
+		alreadyExists, err := s.blockRetriever.IsBlockRetrievable(at)
+		if err != nil {
+			err = fmt.Errorf("error checking warm block load valid: %v", err)
+			instrument.EmitAndLogInvariantViolation(s.opts.InstrumentOptions(),
+				func(l *zap.Logger) {
+					l.Error("warm load block invariant", zap.Error(err))
+				})
+			return err
+		}
+		if alreadyExists {
+			err = fmt.Errorf(
+				"warm block load for block that exists: block_start=%s", at)
+			instrument.EmitAndLogInvariantViolation(s.opts.InstrumentOptions(),
+				func(l *zap.Logger) {
+					l.Error("warm load block invariant", zap.Error(err))
+				})
+			return err
+		}
 	}
 
 	s.Lock()
-	s.loadWithLock(false, blocksToLoad, blockStates)
+	s.buffer.Load(block, writeType)
 	s.Unlock()
-	return LoadResult{}, nil
-}
-
-func (s *dbSeries) bootstrap(
-	bootstrappedBlocks block.DatabaseSeriesBlocks,
-	blockStates BootstrappedBlockStateSnapshot,
-) (BootstrapResult, error) {
-	s.Lock()
-	defer func() {
-		s.bs = bootstrapped
-		s.Unlock()
-	}()
-
-	var result BootstrapResult
-	if s.bs == bootstrapped {
-		return result, errSeriesAlreadyBootstrapped
-	}
-
-	if bootstrappedBlocks == nil {
-		return result, nil
-	}
-
-	s.loadWithLock(true, bootstrappedBlocks, blockStates)
-	result.NumBlocksMovedToBuffer += int64(bootstrappedBlocks.Len())
-
-	return result, nil
-}
-
-func (s *dbSeries) loadWithLock(
-	isBootstrap bool,
-	blocksToLoad block.DatabaseSeriesBlocks,
-	blockStates BootstrappedBlockStateSnapshot,
-) {
-	for _, block := range blocksToLoad.AllBlocks() {
-		if !isBootstrap {
-			// The data being loaded is not part of the bootstrap process then it needs to be
-			// loaded as a cold write because the load could be happening concurrently with
-			// other processes like the flush (as opposed to bootstrap which cannot happen
-			// concurrently with a flush) and there is no way to know if this series/block
-			// combination has been warm flushed or not yet since updating the shard block state
-			// doesn't happen until the entire flush completes.
-			//
-			// As a result the only safe operation is to load the block as a cold write which
-			// ensures that the data will eventually be flushed and merged with the existing data
-			// on disk in the two scenarios where the Load() API is used (cold writes and repairs).
-			s.buffer.Load(block, ColdWrite)
-			continue
-		}
-
-		blStartNano := xtime.ToUnixNano(block.StartTime())
-		blState := blockStates.Snapshot[blStartNano]
-		if !blState.WarmRetrievable {
-			// If the block being bootstrapped has never been warm flushed before then the block
-			// can be loaded into the buffer as a WarmWrite because a subsequent warm flush will
-			// ensure that it gets persisted to disk.
-			//
-			// If the ColdWrites feature is disabled then this branch should always be followed.
-			s.buffer.Load(block, WarmWrite)
-		} else {
-			// If the block being bootstrapped has been warm flushed before then the block should
-			// be loaded into the buffer as a ColdWrite so that a subsequent cold flush will ensure
-			// that it gets persisted to disk.
-			//
-			// This branch can be executed in the situation that a cold write was received for a block
-			// that had already been flushed to disk. Before the cold write could be persisted to disk
-			// via a cold flush, the node crashed and began bootsrapping itself. The cold write would be
-			// read out of the commitlog and would eventually be loaded into the buffer via this branch.
-			s.buffer.Load(block, ColdWrite)
-		}
-	}
+	return nil
 }
 
 func (s *dbSeries) OnRetrieveBlock(
@@ -562,14 +526,12 @@ func (s *dbSeries) WarmFlush(
 	persistFn persist.DataFn,
 	nsCtx namespace.Context,
 ) (FlushOutcome, error) {
+	// Need a write lock because the buffer WarmFlush method mutates
+	// state (by performing a pro-active merge).
 	s.Lock()
-	defer s.Unlock()
-
-	if s.bs != bootstrapped {
-		return FlushOutcomeErr, errSeriesNotBootstrapped
-	}
-
-	return s.buffer.WarmFlush(ctx, blockStart, s.id, s.tags, persistFn, nsCtx)
+	outcome, err := s.buffer.WarmFlush(ctx, blockStart, s.id, s.tags, persistFn, nsCtx)
+	s.Unlock()
+	return outcome, err
 }
 
 func (s *dbSeries) Snapshot(
@@ -582,10 +544,6 @@ func (s *dbSeries) Snapshot(
 	// state (by performing a pro-active merge).
 	s.Lock()
 	defer s.Unlock()
-
-	if s.bs != bootstrapped {
-		return errSeriesNotBootstrapped
-	}
 
 	return s.buffer.Snapshot(ctx, blockStart, s.id, s.tags, persistFn, nsCtx)
 }
@@ -601,9 +559,10 @@ func (s *dbSeries) Close() {
 	s.Lock()
 	defer s.Unlock()
 
-	// See Reset() for why these aren't finalized
+	// See Reset() for why these aren't finalized.
 	s.id = nil
 	s.tags = ident.Tags{}
+	s.uniqueIndex = 0
 
 	switch s.opts.CachePolicy() {
 	case CacheLRU:
@@ -618,7 +577,7 @@ func (s *dbSeries) Close() {
 
 	// Reset (not close) underlying resources because the series will go
 	// back into the pool and be re-used.
-	s.buffer.Reset(nil, s.opts)
+	s.buffer.Reset(databaseBufferResetOptions{Options: s.opts})
 	s.cachedBlocks.Reset()
 
 	if s.pool != nil {
@@ -626,18 +585,8 @@ func (s *dbSeries) Close() {
 	}
 }
 
-func (s *dbSeries) Reset(
-	id ident.ID,
-	tags ident.Tags,
-	blockRetriever QueryableBlockRetriever,
-	onRetrieveBlock block.OnRetrieveBlock,
-	onEvictedFromWiredList block.OnEvictedFromWiredList,
-	opts Options,
-) {
-	s.Lock()
-	defer s.Unlock()
-
-	// NB(r): We explicitly do not place this ID back into an
+func (s *dbSeries) Reset(opts DatabaseSeriesOptions) {
+	// NB(r): We explicitly do not place the ID back into an
 	// existing pool as high frequency users of series IDs such
 	// as the commit log need to use the reference without the
 	// overhead of ownership tracking. In addition, the blocks
@@ -652,14 +601,21 @@ func (s *dbSeries) Reset(
 	// Since series are purged so infrequently the overhead
 	// of not releasing back an ID to a pool is amortized over
 	// a long period of time.
-	s.id = id
-	s.tags = tags
-
+	//
+	// The same goes for the series tags.
+	s.Lock()
+	s.id = opts.ID
+	s.tags = opts.Tags
+	s.uniqueIndex = opts.UniqueIndex
 	s.cachedBlocks.Reset()
-	s.buffer.Reset(id, opts)
-	s.opts = opts
-	s.bs = bootstrapNotStarted
-	s.blockRetriever = blockRetriever
-	s.onRetrieveBlock = onRetrieveBlock
-	s.blockOnEvictedFromWiredList = onEvictedFromWiredList
+	s.buffer.Reset(databaseBufferResetOptions{
+		ID:             opts.ID,
+		BlockRetriever: opts.BlockRetriever,
+		Options:        opts.Options,
+	})
+	s.opts = opts.Options
+	s.blockRetriever = opts.BlockRetriever
+	s.onRetrieveBlock = opts.OnRetrieveBlock
+	s.blockOnEvictedFromWiredList = opts.OnEvictedFromWiredList
+	s.Unlock()
 }

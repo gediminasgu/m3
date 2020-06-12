@@ -82,16 +82,18 @@ func newSeriesTestOptions() Options {
 
 func TestSeriesEmpty(t *testing.T) {
 	opts := newSeriesTestOptions()
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:      ident.StringID("foo"),
+		Options: opts,
+	})
 	assert.True(t, series.IsEmpty())
 }
 
 // Writes to series, verifying no error and that further writes should happen.
-func verifyWriteToSeries(t *testing.T, series *dbSeries, v value) {
+func verifyWriteToSeries(t *testing.T, series *dbSeries, v DecodedTestValue) {
 	ctx := context.NewContext()
-	wasWritten, err := series.Write(ctx, v.timestamp, v.value, v.unit, v.annotation, WriteOptions{})
+	wasWritten, _, err := series.Write(ctx, v.Timestamp, v.Value,
+		v.Unit, v.Annotation, WriteOptions{})
 	require.NoError(t, err)
 	require.True(t, wasWritten)
 	ctx.Close()
@@ -104,11 +106,27 @@ func TestSeriesWriteFlush(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(curr).Times(2)
+	bl.EXPECT().Stream(gomock.Any()).Return(xio.BlockReader{}, nil)
+	bl.EXPECT().Close()
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().IsBlockRetrievable(gomock.Any()).Return(false, nil)
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+	err := series.LoadBlock(bl, WarmWrite)
 	assert.NoError(t, err)
 
-	data := []value{
+	data := []DecodedTestValue{
 		{curr, 1, xtime.Second, nil},
 		{curr.Add(mins(1)), 2, xtime.Second, nil},
 		{curr.Add(mins(2)), 3, xtime.Second, nil},
@@ -116,7 +134,7 @@ func TestSeriesWriteFlush(t *testing.T) {
 	}
 
 	for _, v := range data {
-		curr = v.timestamp
+		curr = v.Timestamp
 		verifyWriteToSeries(t, series, v)
 	}
 
@@ -139,11 +157,28 @@ func TestSeriesSamePointDoesNotWrite(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(curr).Times(2)
+	bl.EXPECT().Stream(gomock.Any()).Return(xio.BlockReader{}, nil)
+	bl.EXPECT().Close()
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().IsBlockRetrievable(gomock.Any()).Return(false, nil)
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
 	assert.NoError(t, err)
 
-	data := []value{
+	data := []DecodedTestValue{
 		{curr, 1, xtime.Second, nil},
 		{curr, 1, xtime.Second, nil},
 		{curr, 1, xtime.Second, nil},
@@ -152,9 +187,9 @@ func TestSeriesSamePointDoesNotWrite(t *testing.T) {
 	}
 
 	for i, v := range data {
-		curr = v.timestamp
+		curr = v.Timestamp
 		ctx := context.NewContext()
-		wasWritten, err := series.Write(ctx, v.timestamp, v.value, v.unit, v.annotation, WriteOptions{})
+		wasWritten, _, err := series.Write(ctx, v.Timestamp, v.Value, v.Unit, v.Annotation, WriteOptions{})
 		require.NoError(t, err)
 		if i == 0 || i == len(data)-1 {
 			require.True(t, wasWritten)
@@ -182,11 +217,30 @@ func TestSeriesWriteFlushRead(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(curr).Times(2)
+	bl.EXPECT().Len().Return(0).Times(2)
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
 	assert.NoError(t, err)
 
-	data := []value{
+	data := []DecodedTestValue{
 		{curr.Add(mins(1)), 2, xtime.Second, nil},
 		{curr.Add(mins(3)), 3, xtime.Second, nil},
 		{curr.Add(mins(5)), 4, xtime.Second, nil},
@@ -195,7 +249,7 @@ func TestSeriesWriteFlushRead(t *testing.T) {
 	}
 
 	for _, v := range data {
-		curr = v.timestamp
+		curr = v.Timestamp
 		verifyWriteToSeries(t, series, v)
 	}
 
@@ -224,25 +278,24 @@ func TestSeriesWriteFlushRead(t *testing.T) {
 // cold writes and that for the load path everything is loaded as cold writes.
 func TestSeriesBootstrapAndLoad(t *testing.T) {
 	testCases := []struct {
-		title    string
-		loadOpts LoadOptions
-		f        func(
-			series DatabaseSeries,
-			blocks block.DatabaseSeriesBlocks,
-			blockStates BootstrappedBlockStateSnapshot)
+		title         string
+		bootstrapping bool
 	}{
 		{
-			title:    "load",
-			loadOpts: LoadOptions{},
+			title:         "load",
+			bootstrapping: false,
 		},
 		{
-			title:    "bootstrap",
-			loadOpts: LoadOptions{Bootstrap: true},
+			title:         "bootstrap",
+			bootstrapping: true,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.title, func(t *testing.T) {
+			ctrl := gomock.NewController(t)
+			defer ctrl.Finish()
+
 			var (
 				opts      = newSeriesTestOptions()
 				blockSize = opts.RetentionOptions().BlockSize()
@@ -252,21 +305,9 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 			opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 				return curr
 			}))
-			series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-
-			rawWrites := []value{
-				{curr.Add(mins(1)), 2, xtime.Second, nil},
-				{curr.Add(mins(3)), 3, xtime.Second, nil},
-				{curr.Add(mins(5)), 4, xtime.Second, nil},
-			}
-
-			for _, v := range rawWrites {
-				curr = v.timestamp
-				verifyWriteToSeries(t, series, v)
-			}
 
 			var (
-				loadWrites = []value{
+				loadWrites = []DecodedTestValue{
 					// Ensure each value is in a separate block so since block.DatabaseSeriesBlocks
 					// can only store a single block per block start).
 					{curr.Add(blockSize), 5, xtime.Second, nil},
@@ -274,7 +315,6 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 				}
 				nsCtx                        = namespace.Context{}
 				blockOpts                    = opts.DatabaseBlockOptions()
-				blocks                       = block.NewDatabaseSeriesBlocks(len(loadWrites))
 				alreadyWarmFlushedBlockStart = curr.Add(blockSize).Truncate(blockSize)
 				notYetWarmFlushedBlockStart  = curr.Add(2 * blockSize).Truncate(blockSize)
 				blockStates                  = BootstrappedBlockStateSnapshot{
@@ -289,20 +329,61 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 					},
 				}
 			)
-			for _, v := range loadWrites {
-				curr = v.timestamp
-				enc := opts.EncoderPool().Get()
-				blockStart := v.timestamp.Truncate(blockSize)
-				enc.Reset(blockStart, 0, nil)
-				dp := ts.Datapoint{Timestamp: v.timestamp, Value: v.value}
-				require.NoError(t, enc.Encode(dp, v.unit, nil))
+			blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+			blockRetriever.EXPECT().
+				IsBlockRetrievable(gomock.Any()).
+				DoAndReturn(func(at time.Time) (bool, error) {
+					value, exists := blockStates.Snapshot[xtime.ToUnixNano(at)]
+					if !exists {
+						// No block exists, should be a warm write.
+						return false, nil
+					}
+					return value.WarmRetrievable, nil
+				}).
+				AnyTimes()
+			blockRetriever.EXPECT().
+				Stream(gomock.Any(), gomock.Any(), gomock.Any(),
+					gomock.Any(), gomock.Any()).
+				Return(xio.EmptyBlockReader, nil).
+				AnyTimes()
 
-				dbBlock := block.NewDatabaseBlock(blockStart, blockSize, enc.Discard(), blockOpts, nsCtx)
-				blocks.AddBlock(dbBlock)
+			series := NewDatabaseSeries(DatabaseSeriesOptions{
+				ID:             ident.StringID("foo"),
+				BlockRetriever: blockRetriever,
+				Options:        opts,
+			}).(*dbSeries)
+
+			rawWrites := []DecodedTestValue{
+				{curr.Add(mins(1)), 2, xtime.Second, nil},
+				{curr.Add(mins(3)), 3, xtime.Second, nil},
+				{curr.Add(mins(5)), 4, xtime.Second, nil},
 			}
 
-			_, err := series.Load(tc.loadOpts, blocks, blockStates)
-			require.NoError(t, err)
+			for _, v := range rawWrites {
+				curr = v.Timestamp
+				verifyWriteToSeries(t, series, v)
+			}
+
+			for _, v := range loadWrites {
+				curr = v.Timestamp
+				enc := opts.EncoderPool().Get()
+				blockStart := v.Timestamp.Truncate(blockSize)
+				enc.Reset(blockStart, 0, nil)
+				dp := ts.Datapoint{Timestamp: v.Timestamp, Value: v.Value}
+				require.NoError(t, enc.Encode(dp, v.Unit, nil))
+
+				dbBlock := block.NewDatabaseBlock(blockStart, blockSize, enc.Discard(), blockOpts, nsCtx)
+
+				writeType := ColdWrite
+				if tc.bootstrapping {
+					if blockStart.Equal(notYetWarmFlushedBlockStart) {
+						writeType = WarmWrite
+					}
+				}
+
+				err := series.LoadBlock(dbBlock, writeType)
+				require.NoError(t, err)
+			}
 
 			t.Run("Data can be read", func(t *testing.T) {
 				ctx := context.NewContext()
@@ -311,7 +392,10 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 				results, err := series.ReadEncoded(ctx, start, start.Add(10*blockSize), nsCtx)
 				require.NoError(t, err)
 
-				expectedData := append(rawWrites, loadWrites...)
+				var expectedData []DecodedTestValue
+				expectedData = append(expectedData, rawWrites...)
+				expectedData = append(expectedData, loadWrites...)
+				sort.Sort(ValuesByTime(expectedData))
 				requireReaderValuesEqual(t, expectedData, results, opts, nsCtx)
 			})
 
@@ -327,11 +411,11 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 					return coldFlushBlockStarts[i] < coldFlushBlockStarts[j]
 				})
 
-				if tc.loadOpts.Bootstrap {
+				if tc.bootstrapping {
 					// If its a bootstrap then we need to make sure that everything gets loaded as warm/cold writes
 					// correctly based on the flush state.
 					expectedColdFlushBlockStarts := []xtime.UnixNano{xtime.ToUnixNano(alreadyWarmFlushedBlockStart)}
-					require.Equal(t, expectedColdFlushBlockStarts, coldFlushBlockStarts)
+					assert.Equal(t, expectedColdFlushBlockStarts, coldFlushBlockStarts)
 				} else {
 					// If its just a regular load then everything should be loaded as cold writes for correctness
 					// since flushes and loads can happen concurrently.
@@ -339,7 +423,7 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 						xtime.ToUnixNano(alreadyWarmFlushedBlockStart),
 						xtime.ToUnixNano(notYetWarmFlushedBlockStart),
 					}
-					require.Equal(t, expectedColdFlushBlockStarts, coldFlushBlockStarts)
+					assert.Equal(t, expectedColdFlushBlockStarts, coldFlushBlockStarts)
 				}
 			})
 		})
@@ -348,8 +432,26 @@ func TestSeriesBootstrapAndLoad(t *testing.T) {
 
 func TestSeriesReadEndBeforeStart(t *testing.T) {
 	opts := newSeriesTestOptions()
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
+
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	})
+
+	err := series.LoadBlock(bl, WarmWrite)
 	assert.NoError(t, err)
 
 	ctx := context.NewContext()
@@ -363,10 +465,29 @@ func TestSeriesReadEndBeforeStart(t *testing.T) {
 }
 
 func TestSeriesFlushNoBlock(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	opts := newSeriesTestOptions()
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
+
 	flushTime := time.Unix(7200, 0)
 	outcome, err := series.WarmFlush(nil, flushTime, nil, namespace.Context{})
 	require.Nil(t, err)
@@ -377,14 +498,28 @@ func TestSeriesFlush(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	curr := time.Unix(7200, 0)
 	opts := newSeriesTestOptions()
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
 
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
 	assert.NoError(t, err)
 
 	ctx := context.NewContext()
@@ -410,10 +545,11 @@ func TestSeriesFlush(t *testing.T) {
 
 func TestSeriesTickEmptySeries(t *testing.T) {
 	opts := newSeriesTestOptions()
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
-	_, err = series.Tick(NewShardBlockStateSnapshot(true, BootstrappedBlockStateSnapshot{}), namespace.Context{})
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:      ident.StringID("foo"),
+		Options: opts,
+	}).(*dbSeries)
+	_, err := series.Tick(NewShardBlockStateSnapshot(true, BootstrappedBlockStateSnapshot{}), namespace.Context{})
 	require.Equal(t, ErrSeriesAllDatapointsExpired, err)
 }
 
@@ -421,10 +557,26 @@ func TestSeriesTickDrainAndResetBuffer(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	opts := newSeriesTestOptions()
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
+
 	buffer := NewMockdatabaseBuffer(ctrl)
 	series.buffer = buffer
 	buffer.EXPECT().Tick(gomock.Any(), gomock.Any()).Return(bufferTickResult{})
@@ -440,15 +592,32 @@ func TestSeriesTickNeedsBlockExpiry(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	opts := newSeriesTestOptions()
+	opts = opts.SetCachePolicy(CacheRecentlyRead)
 	ropts := opts.RetentionOptions()
 	curr := time.Now().Truncate(ropts.BlockSize())
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
+
 	blockStart := curr.Add(-ropts.RetentionPeriod()).Add(-ropts.BlockSize())
 	b := block.NewMockDatabaseBlock(ctrl)
 	b.EXPECT().StartTime().Return(blockStart)
@@ -491,6 +660,9 @@ func TestSeriesTickRecentlyRead(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	opts := newSeriesTestOptions()
 	opts = opts.
 		SetCachePolicy(CacheRecentlyRead).
@@ -500,11 +672,21 @@ func TestSeriesTickRecentlyRead(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
+
 	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
-	series.blockRetriever = blockRetriever
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
 
 	// Test case where block has been read within expiry period - won't be removed
 	b := block.NewMockDatabaseBlock(ctrl)
@@ -566,6 +748,9 @@ func TestSeriesTickCacheLRU(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	retentionPeriod := time.Hour
 	opts := newSeriesTestOptions()
 	opts = opts.
@@ -576,11 +761,21 @@ func TestSeriesTickCacheLRU(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
+
 	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
-	series.blockRetriever = blockRetriever
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
 
 	// Test case where block was not retrieved from disk - Will be removed
 	b := block.NewMockDatabaseBlock(ctrl)
@@ -650,6 +845,9 @@ func TestSeriesTickCacheNone(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).Times(2)
+
 	opts := newSeriesTestOptions()
 	opts = opts.
 		SetCachePolicy(CacheNone).
@@ -659,11 +857,21 @@ func TestSeriesTickCacheNone(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
+
 	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
-	series.blockRetriever = blockRetriever
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
 
 	// Retrievable blocks should be removed
 	b := block.NewMockDatabaseBlock(ctrl)
@@ -714,7 +922,10 @@ func TestSeriesTickCachedBlockRemove(t *testing.T) {
 	opts = opts.SetCachePolicy(CacheAll)
 	ropts := opts.RetentionOptions()
 	curr := time.Now().Truncate(ropts.BlockSize())
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:      ident.StringID("foo"),
+		Options: opts,
+	}).(*dbSeries)
 
 	// Add current block
 	b := block.NewMockDatabaseBlock(ctrl)
@@ -779,9 +990,12 @@ func TestSeriesFetchBlocks(t *testing.T) {
 		SegmentReader: xio.NewSegmentReader(ts.Segment{}),
 	}, nil)
 	blocks.EXPECT().BlockAt(starts[0]).Return(b, true)
+
 	b = block.NewMockDatabaseBlock(ctrl)
+	b.EXPECT().StartTime().Return(starts[1]).AnyTimes()
 	b.EXPECT().Stream(ctx).Return(xio.EmptyBlockReader, errors.New("bar"))
 	blocks.EXPECT().BlockAt(starts[1]).Return(b, true)
+
 	blocks.EXPECT().BlockAt(starts[2]).Return(nil, false)
 
 	// Set up the buffer
@@ -791,9 +1005,20 @@ func TestSeriesFetchBlocks(t *testing.T) {
 		FetchBlocks(ctx, starts, namespace.Context{}).
 		Return([]block.FetchBlockResult{block.NewFetchBlockResult(starts[2], nil, nil)})
 
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(b, WarmWrite)
+	require.NoError(t, err)
 
 	series.cachedBlocks = blocks
 	series.buffer = buffer
@@ -848,9 +1073,24 @@ func TestSeriesFetchBlocksMetadata(t *testing.T) {
 		FetchBlocksMetadata(ctx, start, end, fetchOpts).
 		Return(expectedResults, nil)
 
-	series := NewDatabaseSeries(ident.StringID("bar"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(start).AnyTimes()
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("bar"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
+
 	series.buffer = buffer
 
 	res, err := series.FetchBlocksMetadata(ctx, start, end, fetchOpts)
@@ -908,18 +1148,21 @@ func TestSeriesOutOfOrderWritesAndRotate(t *testing.T) {
 		expected   []ts.Datapoint
 	)
 
-	series := NewDatabaseSeries(id, tags, opts).(*dbSeries)
-	series.Reset(id, tags, nil, nil, nil, opts)
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:      id,
+		Tags:    tags,
+		Options: opts,
+	}).(*dbSeries)
 
 	for iter := 0; iter < numBlocks; iter++ {
 		start := now
 		value := startValue
 
 		for i := 0; i < numPoints; i++ {
-			wasWritten, err := series.Write(ctx, start, value, xtime.Second, nil, WriteOptions{})
+			wasWritten, _, err := series.Write(ctx, start, value, xtime.Second, nil, WriteOptions{})
 			require.NoError(t, err)
 			assert.True(t, wasWritten)
-			expected = append(expected, ts.Datapoint{Timestamp: start, Value: value})
+			expected = append(expected, ts.Datapoint{Timestamp: start, TimestampNanos: xtime.ToUnixNano(start), Value: value})
 			start = start.Add(10 * time.Second)
 			value = value + 1.0
 		}
@@ -928,7 +1171,7 @@ func TestSeriesOutOfOrderWritesAndRotate(t *testing.T) {
 		start = now
 		value = startValue
 		for i := 0; i < numPoints/2; i++ {
-			wasWritten, err := series.Write(ctx, start, value, xtime.Second, nil, WriteOptions{})
+			wasWritten, _, err := series.Write(ctx, start, value, xtime.Second, nil, WriteOptions{})
 			require.NoError(t, err)
 			assert.True(t, wasWritten)
 			start = start.Add(10 * time.Second)
@@ -948,8 +1191,8 @@ func TestSeriesOutOfOrderWritesAndRotate(t *testing.T) {
 		ID:             id,
 		Namespace:      nsID,
 		Tags:           ident.NewTagsIterator(tags),
-		StartInclusive: qStart,
-		EndExclusive:   qEnd,
+		StartInclusive: xtime.ToUnixNano(qStart),
+		EndExclusive:   xtime.ToUnixNano(qEnd),
 		Replicas:       []encoding.MultiReaderIterator{multiIt},
 	}, nil)
 	defer it.Close()
@@ -965,15 +1208,24 @@ func TestSeriesOutOfOrderWritesAndRotate(t *testing.T) {
 }
 
 func TestSeriesWriteReadFromTheSameBucket(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	bl := block.NewMockDatabaseBlock(ctrl)
+	bl.EXPECT().StartTime().Return(time.Now()).AnyTimes()
+	bl.EXPECT().Len().Return(0).AnyTimes()
+
 	opts := newSeriesTestOptions()
 	opts = opts.SetRetentionOptions(opts.RetentionOptions().
 		SetRetentionPeriod(40 * 24 * time.Hour).
-		// A block size of 5 days is not equally as divisible as seconds from time zero and seconds from time epoch.
+		// A block size of 5 days is not equally as divisible as seconds from time
+		// zero and seconds from time epoch.
 		// now := time.Now()
 		// blockSize := 5 * 24 * time.Hour
 		// fmt.Println(now) -> 2018-01-24 14:29:31.624265 -0500 EST m=+0.003810489
 		// fmt.Println(now.Truncate(blockSize)) -> 2018-01-21 19:00:00 -0500 EST
-		// fmt.Println(time.Unix(0, now.UnixNano()/int64(blockSize)*int64(blockSize))) -> 2018-01-23 19:00:00 -0500 EST
+		// fmt.Println(time.Unix(0, now.UnixNano()/int64(blockSize)*int64(blockSize)))
+		//                                       -> 2018-01-23 19:00:00 -0500 EST
 		SetBlockSize(5 * 24 * time.Hour).
 		SetBufferFuture(10 * time.Minute).
 		SetBufferPast(20 * time.Minute))
@@ -981,24 +1233,40 @@ func TestSeriesWriteReadFromTheSameBucket(t *testing.T) {
 	opts = opts.SetClockOptions(opts.ClockOptions().SetNowFn(func() time.Time {
 		return curr
 	}))
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
-	_, err := series.Load(LoadOptions{Bootstrap: true}, nil, BootstrappedBlockStateSnapshot{})
-	assert.NoError(t, err)
+
+	blockRetriever := NewMockQueryableBlockRetriever(ctrl)
+	blockRetriever.EXPECT().
+		IsBlockRetrievable(gomock.Any()).
+		Return(false, nil).
+		AnyTimes()
+
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:             ident.StringID("foo"),
+		BlockRetriever: blockRetriever,
+		Options:        opts,
+	}).(*dbSeries)
+
+	err := series.LoadBlock(bl, WarmWrite)
+	require.NoError(t, err)
 
 	ctx := context.NewContext()
 	defer ctx.Close()
 
-	wasWritten, err := series.Write(ctx, curr.Add(-3*time.Minute), 1, xtime.Second, nil, WriteOptions{})
+	wasWritten, _, err := series.Write(ctx, curr.Add(-3*time.Minute),
+		1, xtime.Second, nil, WriteOptions{})
 	assert.NoError(t, err)
 	assert.True(t, wasWritten)
-	wasWritten, err = series.Write(ctx, curr.Add(-2*time.Minute), 2, xtime.Second, nil, WriteOptions{})
+	wasWritten, _, err = series.Write(ctx, curr.Add(-2*time.Minute),
+		2, xtime.Second, nil, WriteOptions{})
 	assert.NoError(t, err)
 	assert.True(t, wasWritten)
-	wasWritten, err = series.Write(ctx, curr.Add(-1*time.Minute), 3, xtime.Second, nil, WriteOptions{})
+	wasWritten, _, err = series.Write(ctx, curr.Add(-1*time.Minute),
+		3, xtime.Second, nil, WriteOptions{})
 	assert.NoError(t, err)
 	assert.True(t, wasWritten)
 
-	results, err := series.ReadEncoded(ctx, curr.Add(-5*time.Minute), curr.Add(time.Minute), namespace.Context{})
+	results, err := series.ReadEncoded(ctx, curr.Add(-5*time.Minute),
+		curr.Add(time.Minute), namespace.Context{})
 	require.NoError(t, err)
 	values, err := decodedReaderValues(results, opts, namespace.Context{})
 	require.NoError(t, err)
@@ -1012,7 +1280,10 @@ func TestSeriesCloseNonCacheLRUPolicy(t *testing.T) {
 
 	opts := newSeriesTestOptions().
 		SetCachePolicy(CacheRecentlyRead)
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:      ident.StringID("foo"),
+		Options: opts,
+	}).(*dbSeries)
 
 	start := time.Now()
 	blocks := block.NewDatabaseSeriesBlocks(0)
@@ -1031,7 +1302,10 @@ func TestSeriesCloseCacheLRUPolicy(t *testing.T) {
 
 	opts := newSeriesTestOptions().
 		SetCachePolicy(CacheLRU)
-	series := NewDatabaseSeries(ident.StringID("foo"), ident.Tags{}, opts).(*dbSeries)
+	series := NewDatabaseSeries(DatabaseSeriesOptions{
+		ID:      ident.StringID("foo"),
+		Options: opts,
+	}).(*dbSeries)
 
 	start := time.Now()
 	blocks := block.NewDatabaseSeriesBlocks(0)
@@ -1042,7 +1316,8 @@ func TestSeriesCloseCacheLRUPolicy(t *testing.T) {
 
 	// Add block that was not retrieved from disk
 	nonDiskBlock := block.NewMockDatabaseBlock(ctrl)
-	nonDiskBlock.EXPECT().StartTime().Return(start.Add(opts.RetentionOptions().BlockSize())).AnyTimes()
+	nonDiskBlock.EXPECT().StartTime().
+		Return(start.Add(opts.RetentionOptions().BlockSize())).AnyTimes()
 	blocks.AddBlock(nonDiskBlock)
 
 	series.cachedBlocks = blocks

@@ -28,10 +28,10 @@ import (
 	"path"
 
 	clusterclient "github.com/m3db/m3/src/cluster/client"
-	"github.com/m3db/m3/src/cluster/kv"
 	nsproto "github.com/m3db/m3/src/dbnode/generated/proto/namespace"
 	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/query/generated/proto/admin"
 	"github.com/m3db/m3/src/query/util/logging"
 	"github.com/m3db/m3/src/x/instrument"
@@ -70,7 +70,7 @@ func NewAddHandler(
 }
 
 func (h *AddHandler) ServeHTTP(
-	svc handler.ServiceNameAndDefaults,
+	svc handleroptions.ServiceNameAndDefaults,
 	w http.ResponseWriter,
 	r *http.Request,
 ) {
@@ -84,7 +84,7 @@ func (h *AddHandler) ServeHTTP(
 		return
 	}
 
-	opts := handler.NewServiceOptions(svc, r.Header, nil)
+	opts := handleroptions.NewServiceOptions(svc, r.Header, nil)
 	nsRegistry, err := h.Add(md, opts)
 	if err != nil {
 		if err == errNamespaceExists {
@@ -123,7 +123,7 @@ func (h *AddHandler) parseRequest(r *http.Request) (*admin.NamespaceAddRequest, 
 // Add adds a namespace.
 func (h *AddHandler) Add(
 	addReq *admin.NamespaceAddRequest,
-	opts handler.ServiceOptions,
+	opts handleroptions.ServiceOptions,
 ) (nsproto.Registry, error) {
 	var emptyReg = nsproto.Registry{}
 
@@ -132,11 +132,7 @@ func (h *AddHandler) Add(
 		return emptyReg, fmt.Errorf("unable to get metadata: %v", err)
 	}
 
-	kvOpts := kv.NewOverrideOptions().
-		SetEnvironment(opts.ServiceEnvironment).
-		SetZone(opts.ServiceZone)
-
-	store, err := h.client.Store(kvOpts)
+	store, err := h.client.Store(opts.KVOverrideOptions())
 	if err != nil {
 		return emptyReg, err
 	}

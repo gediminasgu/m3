@@ -122,7 +122,7 @@ func TestShardWriteTaggedSyncRefCountMockIndex(t *testing.T) {
 
 	blockSize := namespaceIndexOptions.BlockSize()
 
-	idx := NewMocknamespaceIndex(ctrl)
+	idx := NewMockNamespaceIndex(ctrl)
 	idx.EXPECT().BlockStartForWriteTime(gomock.Any()).
 		DoAndReturn(func(t time.Time) xtime.UnixNano {
 			return xtime.ToUnixNano(t.Truncate(blockSize))
@@ -174,11 +174,11 @@ func TestShardWriteTaggedSyncRefCountSyncIndex(t *testing.T) {
 	testShardWriteTaggedSyncRefCount(t, idx)
 }
 
-func testShardWriteTaggedSyncRefCount(t *testing.T, idx namespaceIndex) {
+func testShardWriteTaggedSyncRefCount(t *testing.T, idx NamespaceIndex) {
 	var (
 		now   = time.Now()
 		opts  = DefaultTestOptions()
-		shard = testDatabaseShardWithIndexFn(t, opts, idx)
+		shard = testDatabaseShardWithIndexFn(t, opts, idx, false)
 	)
 
 	shard.SetRuntimeOptions(runtime.NewOptions().
@@ -325,7 +325,7 @@ func TestShardWriteTaggedAsyncRefCountMockIndex(t *testing.T) {
 
 	blockSize := namespaceIndexOptions.BlockSize()
 
-	idx := NewMocknamespaceIndex(ctrl)
+	idx := NewMockNamespaceIndex(ctrl)
 	idx.EXPECT().BlockStartForWriteTime(gomock.Any()).
 		DoAndReturn(func(t time.Time) xtime.UnixNano {
 			return xtime.ToUnixNano(t.Truncate(blockSize))
@@ -380,7 +380,7 @@ func TestShardWriteTaggedAsyncRefCountSyncIndex(t *testing.T) {
 	testShardWriteTaggedAsyncRefCount(t, idx, nowFn)
 }
 
-func testShardWriteTaggedAsyncRefCount(t *testing.T, idx namespaceIndex, nowFn func() time.Time) {
+func testShardWriteTaggedAsyncRefCount(t *testing.T, idx NamespaceIndex, nowFn func() time.Time) {
 	testReporter := xmetrics.NewTestStatsReporter(xmetrics.NewTestStatsReporterOptions())
 	scope, closer := tally.NewRootScope(tally.ScopeOptions{
 		Reporter: testReporter,
@@ -400,7 +400,7 @@ func testShardWriteTaggedAsyncRefCount(t *testing.T, idx namespaceIndex, nowFn f
 	opts = opts.
 		SetClockOptions(opts.ClockOptions().SetNowFn(nowFn))
 
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().
 		SetWriteNewSeriesAsync(true))
 	defer shard.Close()

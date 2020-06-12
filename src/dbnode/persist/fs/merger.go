@@ -24,10 +24,10 @@ import (
 	"io"
 	"time"
 
-	"github.com/m3db/m3/src/dbnode/digest"
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/dbnode/persist"
+	"github.com/m3db/m3/src/dbnode/storage/block"
 	"github.com/m3db/m3/src/dbnode/storage/index/convert"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
@@ -88,6 +88,7 @@ func (m *merger) Merge(
 	nextVolumeIndex int,
 	flushPreparer persist.FlushPreparer,
 	nsCtx namespace.Context,
+	onFlush persist.OnFlushSeries,
 ) (err error) {
 	var (
 		reader         = m.reader
@@ -203,7 +204,8 @@ func (m *merger) Merge(
 		idsToFinalize = append(idsToFinalize, id)
 
 		segmentReaders = segmentReaders[:0]
-		segmentReaders = append(segmentReaders, segmentReaderFromData(data, segReader))
+		seg := segmentReaderFromData(data, checksum, segReader)
+		segmentReaders = append(segmentReaders, seg)
 
 		// Check if this series is in memory (and thus requires merging).
 		ctx.Reset()
@@ -252,10 +254,21 @@ func (m *merger) Merge(
 	ctx.Reset()
 	err = mergeWith.ForEachRemaining(
 		ctx, blockStart,
-		func(id ident.ID, tags ident.Tags, mergeWithData []xio.BlockReader) error {
+		func(id ident.ID, tags ident.Tags, mergeWithData block.FetchBlockResult) error {
 			segmentReaders = segmentReaders[:0]
-			segmentReaders = appendBlockReadersToSegmentReaders(segmentReaders, mergeWithData)
+			segmentReaders = appendBlockReadersToSegmentReaders(segmentReaders, mergeWithData.Blocks)
 			err := persistSegmentReaders(id, tags, segmentReaders, iterResources, prepared.Persist)
+
+			if err == nil {
+				err = onFlush.OnFlushNewSeries(persist.OnFlushNewSeriesEvent{
+					Shard:      shard,
+					BlockStart: startTime,
+					FirstWrite: mergeWithData.FirstWrite,
+					ID:         id,
+					Tags:       tags,
+				})
+			}
+
 			// Context is safe to close after persisting data to disk.
 			// Reset context here within the passed in function so that the
 			// context gets reset for each remaining series instead of getting
@@ -282,9 +295,10 @@ func appendBlockReadersToSegmentReaders(segReaders []xio.SegmentReader, brs []xi
 
 func segmentReaderFromData(
 	data checked.Bytes,
+	checksum uint32,
 	segReader xio.SegmentReader,
 ) xio.SegmentReader {
-	seg := ts.NewSegment(data, nil, ts.FinalizeHead)
+	seg := ts.NewSegment(data, nil, checksum, ts.FinalizeHead)
 	segReader.Reset(seg)
 	return segReader
 }
@@ -352,7 +366,7 @@ func persistSegment(
 	segment ts.Segment,
 	persistFn persist.DataFn,
 ) error {
-	checksum := digest.SegmentChecksum(segment)
+	checksum := segment.CalculateChecksum()
 	return persistFn(id, tags, segment, checksum)
 }
 

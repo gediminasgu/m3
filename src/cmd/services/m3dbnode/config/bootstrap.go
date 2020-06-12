@@ -35,7 +35,10 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/bootstrapper/peers"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/bootstrapper/uninitialized"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
+	"github.com/m3db/m3/src/dbnode/storage/index"
+	"github.com/m3db/m3/src/dbnode/storage/index/compaction"
 	"github.com/m3db/m3/src/dbnode/topology"
+	"github.com/m3db/m3/src/m3ninx/index/segment/fst"
 )
 
 var (
@@ -54,6 +57,9 @@ type BootstrapConfiguration struct {
 
 	// Commitlog bootstrapper configuration.
 	Commitlog *BootstrapCommitlogConfiguration `yaml:"commitlog"`
+
+	// Peers bootstrapper configuration.
+	Peers *BootstrapPeersConfiguration `yaml:"peers"`
 
 	// CacheSeriesMetadata determines whether individual bootstrappers cache
 	// series metadata across all calls (namespaces / shards / blocks).
@@ -93,6 +99,25 @@ func newDefaultBootstrapCommitlogConfiguration() BootstrapCommitlogConfiguration
 	}
 }
 
+// BootstrapPeersConfiguration specifies config for the peers bootstrapper.
+type BootstrapPeersConfiguration struct {
+	// StreamShardConcurrency controls how many shards in parallel to stream
+	// for in memory data being streamed between peers (most recent block).
+	// Defaults to: numCPU.
+	StreamShardConcurrency int `yaml:"streamShardConcurrency"`
+	// StreamPersistShardConcurrency controls how many shards in parallel to stream
+	// for historical data being streamed between peers (historical blocks).
+	// Defaults to: numCPU / 2.
+	StreamPersistShardConcurrency int `yaml:"streamPersistShardConcurrency"`
+}
+
+func newDefaultBootstrapPeersConfiguration() BootstrapPeersConfiguration {
+	return BootstrapPeersConfiguration{
+		StreamShardConcurrency:        peers.DefaultShardConcurrency,
+		StreamPersistShardConcurrency: peers.DefaultShardPersistenceConcurrency,
+	}
+}
+
 // BootstrapConfigurationValidator can be used to validate the option sets
 // that the  bootstrap configuration builds.
 // Useful for tests and perhaps verifying same options set across multiple
@@ -118,9 +143,25 @@ func (bsc BootstrapConfiguration) New(
 		return nil, err
 	}
 
+	idxOpts := opts.IndexOptions()
+	compactor, err := compaction.NewCompactor(idxOpts.DocumentArrayPool(),
+		index.DocumentArrayPoolCapacity,
+		idxOpts.SegmentBuilderOptions(),
+		idxOpts.FSTSegmentOptions(),
+		compaction.CompactorOptions{
+			FSTWriterOptions: &fst.WriterOptions{
+				// DisableRegistry is set to true to trade a larger FST size
+				// for a faster FST compaction since we want to reduce the end
+				// to end latency for time to first index a metric.
+				DisableRegistry: true,
+			},
+		})
+	if err != nil {
+		return nil, err
+	}
+
 	var (
 		bs     bootstrap.BootstrapperProvider
-		err    error
 		fsOpts = opts.CommitLogOptions().FilesystemOptions()
 	)
 	// Start from the end of the list because the bootstrappers are ordered by precedence in descending order.
@@ -136,9 +177,10 @@ func (bsc BootstrapConfiguration) New(
 				SetInstrumentOptions(opts.InstrumentOptions()).
 				SetResultOptions(rsOpts).
 				SetFilesystemOptions(fsOpts).
+				SetIndexOptions(opts.IndexOptions()).
 				SetPersistManager(opts.PersistManager()).
+				SetCompactor(compactor).
 				SetBoostrapDataNumProcessors(fsCfg.numCPUs()).
-				SetDatabaseBlockRetrieverManager(opts.DatabaseBlockRetrieverManager()).
 				SetRuntimeOptionsManager(opts.RuntimeOptionsManager()).
 				SetIdentifierPool(opts.IdentifierPool())
 			if err := validator.ValidateFilesystemBootstrapperOptions(fsbOpts); err != nil {
@@ -167,13 +209,18 @@ func (bsc BootstrapConfiguration) New(
 				return nil, err
 			}
 		case peers.PeersBootstrapperName:
+			pCfg := bsc.peersConfig()
 			pOpts := peers.NewOptions().
 				SetResultOptions(rsOpts).
+				SetFilesystemOptions(fsOpts).
+				SetIndexOptions(opts.IndexOptions()).
 				SetAdminClient(adminClient).
 				SetPersistManager(opts.PersistManager()).
-				SetDatabaseBlockRetrieverManager(opts.DatabaseBlockRetrieverManager()).
+				SetCompactor(compactor).
 				SetRuntimeOptionsManager(opts.RuntimeOptionsManager()).
-				SetContextPool(opts.ContextPool())
+				SetContextPool(opts.ContextPool()).
+				SetDefaultShardConcurrency(pCfg.StreamShardConcurrency).
+				SetShardPersistenceConcurrency(pCfg.StreamPersistShardConcurrency)
 			if err := validator.ValidatePeersBootstrapperOptions(pOpts); err != nil {
 				return nil, err
 			}
@@ -215,6 +262,13 @@ func (bsc BootstrapConfiguration) commitlogConfig() BootstrapCommitlogConfigurat
 		return *cfg
 	}
 	return newDefaultBootstrapCommitlogConfiguration()
+}
+
+func (bsc BootstrapConfiguration) peersConfig() BootstrapPeersConfiguration {
+	if cfg := bsc.Peers; cfg != nil {
+		return *cfg
+	}
+	return newDefaultBootstrapPeersConfiguration()
 }
 
 type bootstrapConfigurationValidator struct {

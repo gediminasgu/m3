@@ -51,12 +51,14 @@ type replicatedSession struct {
 	log                  *zap.Logger
 	metrics              replicatedSessionMetrics
 	outCh                chan error
+	writeTimestampOffset time.Duration
 }
 
 type replicatedSessionMetrics struct {
 	replicateExecuted    tally.Counter
 	replicateNotExecuted tally.Counter
 	replicateError       tally.Counter
+	replicateSuccess     tally.Counter
 }
 
 func newReplicatedSessionMetrics(scope tally.Scope) replicatedSessionMetrics {
@@ -64,6 +66,7 @@ func newReplicatedSessionMetrics(scope tally.Scope) replicatedSessionMetrics {
 		replicateExecuted:    scope.Counter("replicate.executed"),
 		replicateNotExecuted: scope.Counter("replicate.not-executed"),
 		replicateError:       scope.Counter("replicate.error"),
+		replicateSuccess:     scope.Counter("replicate.success"),
 	}
 }
 
@@ -90,6 +93,7 @@ func newReplicatedSession(opts Options, asyncOpts []Options, options ...replicat
 		scope:                scope,
 		log:                  opts.InstrumentOptions().Logger(),
 		metrics:              newReplicatedSessionMetrics(scope),
+		writeTimestampOffset: opts.WriteTimestampOffset(),
 	}
 
 	// Apply options
@@ -166,6 +170,8 @@ func (s replicatedSession) replicate(params replicatedParams) error {
 				if err != nil {
 					s.metrics.replicateError.Inc(1)
 					s.log.Error("could not replicate write", zap.Error(err))
+				} else {
+					s.metrics.replicateSuccess.Inc(1)
 				}
 				if s.outCh != nil {
 					s.outCh <- err
@@ -189,7 +195,7 @@ func (s replicatedSession) Write(namespace, id ident.ID, t time.Time, value floa
 	return s.replicate(replicatedParams{
 		namespace:  namespace,
 		id:         id,
-		t:          t,
+		t:          t.Add(-s.writeTimestampOffset),
 		value:      value,
 		unit:       unit,
 		annotation: annotation,
@@ -201,7 +207,7 @@ func (s replicatedSession) WriteTagged(namespace, id ident.ID, tags ident.TagIte
 	return s.replicate(replicatedParams{
 		namespace:  namespace,
 		id:         id,
-		t:          t,
+		t:          t.Add(-s.writeTimestampOffset),
 		value:      value,
 		unit:       unit,
 		annotation: annotation,
@@ -223,17 +229,17 @@ func (s replicatedSession) FetchIDs(namespace ident.ID, ids ident.Iterator, star
 // Aggregate aggregates values from the database for the given set of constraints.
 func (s replicatedSession) Aggregate(
 	ns ident.ID, q index.Query, opts index.AggregationOptions,
-) (AggregatedTagsIterator, bool, error) {
+) (AggregatedTagsIterator, FetchResponseMetadata, error) {
 	return s.session.Aggregate(ns, q, opts)
 }
 
 // FetchTagged resolves the provided query to known IDs, and fetches the data for them.
-func (s replicatedSession) FetchTagged(namespace ident.ID, q index.Query, opts index.QueryOptions) (results encoding.SeriesIterators, exhaustive bool, err error) {
+func (s replicatedSession) FetchTagged(namespace ident.ID, q index.Query, opts index.QueryOptions) (encoding.SeriesIterators, FetchResponseMetadata, error) {
 	return s.session.FetchTagged(namespace, q, opts)
 }
 
 // FetchTaggedIDs resolves the provided query to known IDs.
-func (s replicatedSession) FetchTaggedIDs(namespace ident.ID, q index.Query, opts index.QueryOptions) (iter TaggedIDsIterator, exhaustive bool, err error) {
+func (s replicatedSession) FetchTaggedIDs(namespace ident.ID, q index.Query, opts index.QueryOptions) (TaggedIDsIterator, FetchResponseMetadata, error) {
 	return s.session.FetchTaggedIDs(namespace, q, opts)
 }
 

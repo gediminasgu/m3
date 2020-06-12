@@ -25,13 +25,12 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/query/errors"
 	"github.com/m3db/m3/src/query/executor"
 	"github.com/m3db/m3/src/query/functions/utils"
@@ -81,12 +80,18 @@ func parseParams(
 ) (models.RequestParams, *xhttp.ParseError) {
 	var params models.RequestParams
 
+	if err := r.ParseForm(); err != nil {
+		return params, xhttp.NewParseError(
+			fmt.Errorf(formatErrStr, timeParam, err), http.StatusBadRequest)
+	}
+
 	params.Now = time.Now()
 	if v := r.FormValue(timeParam); v != "" {
 		var err error
 		params.Now, err = parseTime(r, timeParam, params.Now)
 		if err != nil {
-			return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, timeParam, err), http.StatusBadRequest)
+			return params, xhttp.NewParseError(
+				fmt.Errorf(formatErrStr, timeParam, err), http.StatusBadRequest)
 		}
 	}
 
@@ -98,31 +103,36 @@ func parseParams(
 	params.Timeout = t
 	start, err := parseTime(r, startParam, params.Now)
 	if err != nil {
-		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, startParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(
+			fmt.Errorf(formatErrStr, startParam, err), http.StatusBadRequest)
 	}
 
 	params.Start = start
 	end, err := parseTime(r, endParam, params.Now)
 	if err != nil {
-		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, endParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(
+			fmt.Errorf(formatErrStr, endParam, err), http.StatusBadRequest)
 	}
 
 	if start.After(end) {
-		return params, xhttp.NewParseError(fmt.Errorf("start (%s) must be before end (%s)",
-			start, end), http.StatusBadRequest)
+		return params, xhttp.NewParseError(
+			fmt.Errorf("start (%s) must be before end (%s)",
+				start, end), http.StatusBadRequest)
 	}
 
 	params.End = end
 	step := fetchOpts.Step
 	if step <= 0 {
 		err := fmt.Errorf("expected positive step size, instead got: %d", step)
-		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, handler.StepParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(
+			fmt.Errorf(formatErrStr, handleroptions.StepParam, err), http.StatusBadRequest)
 	}
 
 	params.Step = fetchOpts.Step
 	query, err := parseQuery(r)
 	if err != nil {
-		return params, xhttp.NewParseError(fmt.Errorf(formatErrStr, queryParam, err), http.StatusBadRequest)
+		return params, xhttp.NewParseError(
+			fmt.Errorf(formatErrStr, queryParam, err), http.StatusBadRequest)
 	}
 
 	params.Query = query
@@ -172,19 +182,25 @@ func parseDebugFlag(r *http.Request, instrumentOpts instrument.Options) bool {
 	return debug
 }
 
-func parseBlockType(r *http.Request, instrumentOpts instrument.Options) models.FetchedBlockType {
+func parseBlockType(
+	r *http.Request,
+	instrumentOpts instrument.Options,
+) models.FetchedBlockType {
 	// Use default block type if unable to parse blockTypeParam.
 	useLegacyVal := r.FormValue(blockTypeParam)
 	if useLegacyVal != "" {
 		intVal, err := strconv.ParseInt(r.FormValue(blockTypeParam), 10, 8)
 		if err != nil {
 			logging.WithContext(r.Context(), instrumentOpts).
-				Warn("unable to parse useLegacy flag", zap.Error(err))
+				Warn("cannot parse block type, defaulting to single", zap.Error(err))
+			return models.TypeSingleBlock
 		}
 
 		blockType := models.FetchedBlockType(intVal)
 		// Ignore error from receiving an invalid block type, and return default.
-		if blockType.Validate() != nil {
+		if err := blockType.Validate(); err != nil {
+			logging.WithContext(r.Context(), instrumentOpts).
+				Warn("cannot validate block type, defaulting to single", zap.Error(err))
 			return models.TypeSingleBlock
 		}
 
@@ -202,15 +218,17 @@ func parseInstantaneousParams(
 	fetchOpts *storage.FetchOptions,
 	instrumentOpts instrument.Options,
 ) (models.RequestParams, *xhttp.ParseError) {
+	if err := r.ParseForm(); err != nil {
+		return models.RequestParams{},
+			xhttp.NewParseError(err, http.StatusBadRequest)
+	}
+
 	if fetchOpts.Step == 0 {
 		fetchOpts.Step = time.Second
 	}
-	if r.Form == nil {
-		r.Form = make(url.Values)
-	}
+
 	r.Form.Set(startParam, nowTimeValue)
 	r.Form.Set(endParam, nowTimeValue)
-
 	params, err := parseParams(r, engineOpts, timeoutOpts,
 		fetchOpts, instrumentOpts)
 	if err != nil {
@@ -221,7 +239,15 @@ func parseInstantaneousParams(
 }
 
 func parseQuery(r *http.Request) (string, error) {
-	queries, ok := r.URL.Query()[queryParam]
+	if err := r.ParseForm(); err != nil {
+		return "", err
+	}
+
+	// NB(schallert): r.Form is generic over GET and POST requests, with body
+	// parameters taking precedence over URL parameters (see r.ParseForm() docs
+	// for more details). We depend on the generic behavior for properly parsing
+	// POST and GET queries.
+	queries, ok := r.Form[queryParam]
 	if !ok || len(queries) == 0 || queries[0] == "" {
 		return "", errors.ErrNoQueryFound
 	}
@@ -263,15 +289,27 @@ func filterNaNSeries(
 	return filtered
 }
 
-func renderResultsJSON(
+// RenderResultsOptions is a set of options for rendering the result.
+type RenderResultsOptions struct {
+	KeepNaNs bool
+	Start    time.Time
+	End      time.Time
+}
+
+// RenderResultsJSON renders results in JSON for range queries.
+func RenderResultsJSON(
 	w io.Writer,
-	series []*ts.Series,
-	params models.RequestParams,
-	keepNans bool,
-) {
+	result ReadResult,
+	opts RenderResultsOptions,
+) error {
+	var (
+		series   = result.Series
+		warnings = result.Meta.WarningStrings()
+	)
+
 	// NB: if dropping NaNs, drop series with only NaNs from output entirely.
-	if !keepNans {
-		series = filterNaNSeries(series, params.Start, params.End)
+	if !opts.KeepNaNs {
+		series = filterNaNSeries(series, opts.Start, opts.End)
 	}
 
 	jw := json.NewWriter(w)
@@ -279,6 +317,16 @@ func renderResultsJSON(
 
 	jw.BeginObjectField("status")
 	jw.WriteString("success")
+
+	if len(warnings) > 0 {
+		jw.BeginObjectField("warnings")
+		jw.BeginArray()
+		for _, warn := range warnings {
+			jw.WriteString(warn)
+		}
+
+		jw.EndArray()
+	}
 
 	jw.BeginObjectField("data")
 	jw.BeginObject()
@@ -306,16 +354,15 @@ func renderResultsJSON(
 			dp := vals.DatapointAt(i)
 
 			// If keepNaNs is set to false and the value is NaN, drop it from the response.
-			if !keepNans && math.IsNaN(dp.Value) {
+			if !opts.KeepNaNs && math.IsNaN(dp.Value) {
 				continue
 			}
 
-			// Skip points before the query boundary. Ideal place to adjust these would be at the result node but that would make it inefficient
-			// since we would need to create another block just for the sake of restricting the bounds.
-			// Each series have the same start time so we just need to calculate the correct startIdx once
-			// NB(r): Removing the optimization of computing startIdx once just in case our assumptions are wrong,
-			// we can always add this optimization back later.  Without this code I see datapoints more often.
-			if dp.Timestamp.Before(params.Start) {
+			// Skip points before the query boundary. Ideal place to adjust these
+			// would be at the result node but that would make it inefficient since
+			// we would need to create another block just for the sake of restricting
+			// the bounds.
+			if dp.Timestamp.Before(opts.Start) {
 				continue
 			}
 
@@ -324,8 +371,8 @@ func renderResultsJSON(
 			jw.WriteString(utils.FormatFloat(dp.Value))
 			jw.EndArray()
 		}
-		jw.EndArray()
 
+		jw.EndArray()
 		fixedStep, ok := s.Values().(ts.FixedResolutionMutableValues)
 		if ok {
 			jw.BeginObjectField("step_size_ms")
@@ -334,22 +381,38 @@ func renderResultsJSON(
 		jw.EndObject()
 	}
 	jw.EndArray()
-
 	jw.EndObject()
 
 	jw.EndObject()
-	jw.Close()
+	return jw.Close()
 }
 
+// renderResultsInstantaneousJSON renders results in JSON for instant queries.
 func renderResultsInstantaneousJSON(
 	w io.Writer,
-	series []*ts.Series,
+	result ReadResult,
+	keepNaNs bool,
 ) {
+	var (
+		series   = result.Series
+		warnings = result.Meta.WarningStrings()
+	)
+
 	jw := json.NewWriter(w)
 	jw.BeginObject()
 
 	jw.BeginObjectField("status")
 	jw.WriteString("success")
+
+	if len(warnings) > 0 {
+		jw.BeginObjectField("warnings")
+		jw.BeginArray()
+		for _, warn := range warnings {
+			jw.WriteString(warn)
+		}
+
+		jw.EndArray()
+	}
 
 	jw.BeginObjectField("data")
 	jw.BeginObject()
@@ -360,6 +423,15 @@ func renderResultsInstantaneousJSON(
 	jw.BeginObjectField("result")
 	jw.BeginArray()
 	for _, s := range series {
+		vals := s.Values()
+		length := s.Len()
+		dp := vals.DatapointAt(length - 1)
+
+		// If keepNaNs is set to false and the value is NaN, drop it from the response.
+		if !keepNaNs && math.IsNaN(dp.Value) {
+			continue
+		}
+
 		jw.BeginObject()
 		jw.BeginObjectField("metric")
 		jw.BeginObject()
@@ -370,12 +442,22 @@ func renderResultsInstantaneousJSON(
 		jw.EndObject()
 
 		jw.BeginObjectField("value")
-		vals := s.Values()
-		length := s.Len()
-		dp := vals.DatapointAt(length - 1)
+
+		onlynans := true
+		for a := 0; a < length; a++ {
+			if !math.IsNaN(vals.ValueAt(a)) {
+				onlynans = false
+				break
+			}
+		}
+
 		jw.BeginArray()
 		jw.WriteInt(int(dp.Timestamp.Unix()))
-		jw.WriteString(utils.FormatFloat(dp.Value))
+		if math.IsNaN(dp.Value) && !onlynans {
+			jw.WriteString("0")
+		} else {
+			jw.WriteString(utils.FormatFloat(dp.Value))
+		}
 		jw.EndArray()
 		jw.EndObject()
 	}

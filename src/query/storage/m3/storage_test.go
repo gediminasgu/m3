@@ -34,6 +34,7 @@ import (
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/test/seriesiter"
 	"github.com/m3db/m3/src/query/ts"
+	"github.com/m3db/m3/src/query/ts/m3db"
 	"github.com/m3db/m3/src/x/ident"
 	"github.com/m3db/m3/src/x/instrument"
 	"github.com/m3db/m3/src/x/sync"
@@ -52,6 +53,10 @@ const (
 	test6MonthRetention  = 180 * 24 * time.Hour
 	test1YearRetention   = 365 * 24 * time.Hour
 	testLongestRetention = test1YearRetention
+)
+
+var (
+	testFetchResponseMetadata = client.FetchResponseMetadata{Exhaustive: true}
 )
 
 type testSessions struct {
@@ -124,9 +129,12 @@ func newTestStorage(t *testing.T, clusters Clusters) storage.Storage {
 		sync.NewPooledWorkerPoolOptions())
 	require.NoError(t, err)
 	writePool.Init()
-	opts := models.NewTagOptions().SetMetricName([]byte("name"))
-	storage, err := NewStorage(clusters, nil, writePool, opts, time.Minute,
-		instrument.NewOptions())
+	tagOpts := models.NewTagOptions().SetMetricName([]byte("name"))
+	opts := m3db.NewOptions().
+		SetWriteWorkerPool(writePool).
+		SetLookbackDuration(time.Minute).
+		SetTagOptions(tagOpts)
+	storage, err := NewStorage(clusters, opts, instrument.NewTestOptions(t))
 	require.NoError(t, err)
 	return storage
 }
@@ -151,28 +159,32 @@ func newFetchReq() *storage.FetchQuery {
 	}
 }
 
-func newWriteQuery() *storage.WriteQuery {
+func newWriteQuery(t *testing.T) *storage.WriteQuery {
 	tags := models.EmptyTags().AddTags([]models.Tag{
 		{Name: []byte("foo"), Value: []byte("bar")},
 		{Name: []byte("biz"), Value: []byte("baz")},
 	})
 
-	datapoints := ts.Datapoints{{
-		Timestamp: time.Now(),
-		Value:     1.0,
-	},
-		{
-			Timestamp: time.Now().Add(-10 * time.Second),
-			Value:     2.0,
-		}}
-	return &storage.WriteQuery{
-		Tags:       tags,
-		Unit:       xtime.Millisecond,
-		Datapoints: datapoints,
+	q, err := storage.NewWriteQuery(storage.WriteQueryOptions{
+		Tags: tags,
+		Unit: xtime.Millisecond,
+		Datapoints: ts.Datapoints{
+			{
+				Timestamp: time.Now(),
+				Value:     1.0,
+			},
+			{
+				Timestamp: time.Now().Add(-10 * time.Second),
+				Value:     2.0,
+			},
+		},
 		Attributes: storage.Attributes{
 			MetricsType: storage.UnaggregatedMetricsType,
 		},
-	}
+	})
+	require.NoError(t, err)
+
+	return q
 }
 
 func setupLocalWrite(t *testing.T, ctrl *gomock.Controller) storage.Storage {
@@ -184,7 +196,7 @@ func setupLocalWrite(t *testing.T, ctrl *gomock.Controller) storage.Storage {
 }
 
 func TestLocalWriteEmpty(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store := setupLocalWrite(t, ctrl)
 	err := store.Write(context.TODO(), nil)
@@ -192,108 +204,121 @@ func TestLocalWriteEmpty(t *testing.T) {
 }
 
 func TestLocalWriteSuccess(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store := setupLocalWrite(t, ctrl)
-	writeQuery := newWriteQuery()
+	writeQuery := newWriteQuery(t)
 	err := store.Write(context.TODO(), writeQuery)
 	assert.NoError(t, err)
 	assert.NoError(t, store.Close())
 }
 
 func TestLocalWriteAggregatedNoClusterNamespaceError(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, _ := setup(t, ctrl)
-	writeQuery := newWriteQuery()
+
+	opts := newWriteQuery(t).Options()
+
 	// Use unsupported retention/resolution
-	writeQuery.Attributes = storage.Attributes{
+	opts.Attributes = storage.Attributes{
 		MetricsType: storage.AggregatedMetricsType,
 		Retention:   1234,
 		Resolution:  5678,
 	}
-	err := store.Write(context.TODO(), writeQuery)
+
+	writeQuery, err := storage.NewWriteQuery(opts)
+	require.NoError(t, err)
+
+	err = store.Write(context.TODO(), writeQuery)
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "no configured cluster namespace"),
 		fmt.Sprintf("unexpected error string: %v", err.Error()))
 }
 
 func TestLocalWriteAggregatedInvalidMetricsTypeError(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, _ := setup(t, ctrl)
-	writeQuery := newWriteQuery()
+
+	opts := newWriteQuery(t).Options()
+
 	// Use unsupported retention/resolution
-	writeQuery.Attributes = storage.Attributes{
+	opts.Attributes = storage.Attributes{
 		MetricsType: storage.MetricsType(math.MaxUint64),
 		Retention:   30 * 24 * time.Hour,
 	}
-	err := store.Write(context.TODO(), writeQuery)
+
+	writeQuery, err := storage.NewWriteQuery(opts)
+	require.NoError(t, err)
+
+	err = store.Write(context.TODO(), writeQuery)
 	assert.Error(t, err)
 	assert.True(t, strings.Contains(err.Error(), "invalid write request"),
 		fmt.Sprintf("unexpected error string: %v", err.Error()))
 }
 
 func TestLocalWriteAggregatedSuccess(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 
-	writeQuery := newWriteQuery()
-	writeQuery.Attributes = storage.Attributes{
+	opts := newWriteQuery(t).Options()
+
+	// Use unsupported retention/resolution
+	opts.Attributes = storage.Attributes{
 		MetricsType: storage.AggregatedMetricsType,
 		Retention:   30 * 24 * time.Hour,
 		Resolution:  time.Minute,
 	}
 
+	writeQuery, err := storage.NewWriteQuery(opts)
+	require.NoError(t, err)
+
 	session := sessions.aggregated1MonthRetention1MinuteResolution
 	session.EXPECT().WriteTagged(gomock.Any(), gomock.Any(), gomock.Any(),
-		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(len(writeQuery.Datapoints))
+		gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(len(writeQuery.Datapoints()))
 
-	err := store.Write(context.TODO(), writeQuery)
+	err = store.Write(context.TODO(), writeQuery)
 	assert.NoError(t, err)
 	assert.NoError(t, store.Close())
 }
 
 func TestLocalRead(t *testing.T) {
-	ctrl := gomock.NewController(xtest.Reporter{T: t})
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 	testTags := seriesiter.GenerateTag()
 
 	session := sessions.unaggregated1MonthRetention
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(seriesiter.NewMockSeriesIters(ctrl, testTags, 1, 2), true, nil)
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTags, 1, 2),
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().
 		Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	searchReq := newFetchReq()
-	results, err := store.Fetch(context.TODO(), searchReq, buildFetchOpts())
-	assert.NoError(t, err)
-	tags := []models.Tag{{Name: testTags.Name.Bytes(), Value: testTags.Value.Bytes()}}
-	require.NotNil(t, results)
-	require.NotNil(t, results.SeriesList)
-	require.Len(t, results.SeriesList, 1)
-	require.NotNil(t, results.SeriesList[0])
-	assert.Equal(t, tags, results.SeriesList[0].Tags.Tags)
-	assert.Equal(t, []byte("name"), results.SeriesList[0].Tags.Opts.MetricName())
+	results, err := store.FetchProm(context.TODO(), searchReq, buildFetchOpts())
+	require.NoError(t, err)
+	assertFetchResult(t, results, testTags)
 }
 
 func TestLocalReadExceedsRetention(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 	testTag := seriesiter.GenerateTag()
 
 	session := sessions.aggregated1YearRetention10MinuteResolution
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2),
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(nil, nil).AnyTimes()
 
 	searchReq := newFetchReq()
 	searchReq.Start = time.Now().Add(-2 * testLongestRetention)
 	searchReq.End = time.Now()
-	results, err := store.Fetch(context.TODO(), searchReq, buildFetchOpts())
+	results, err := store.FetchProm(context.TODO(), searchReq, buildFetchOpts())
 	require.NoError(t, err)
 	assertFetchResult(t, results, testTag)
 }
@@ -305,19 +330,21 @@ func buildFetchOpts() *storage.FetchOptions {
 }
 
 func TestLocalReadExceedsUnaggregatedRetentionWithinAggregatedRetention(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 	testTag := seriesiter.GenerateTag()
 
 	session := sessions.aggregated3MonthRetention5MinuteResolution
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2),
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	session = sessions.aggregatedPartial6MonthRetention1MinuteResolution
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(encoding.EmptySeriesIterators, true, nil)
+		Return(encoding.EmptySeriesIterators,
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	// Test searching between 1month and 3 months (so 2 months) to hit multiple aggregated
@@ -325,13 +352,13 @@ func TestLocalReadExceedsUnaggregatedRetentionWithinAggregatedRetention(t *testi
 	searchReq := newFetchReq()
 	searchReq.Start = time.Now().Add(-2 * test1MonthRetention)
 	searchReq.End = time.Now()
-	results, err := store.Fetch(context.TODO(), searchReq, buildFetchOpts())
+	results, err := store.FetchProm(context.TODO(), searchReq, buildFetchOpts())
 	require.NoError(t, err)
 	assertFetchResult(t, results, testTag)
 }
 
 func TestLocalReadExceedsAggregatedButNotUnaggregatedAndPartialAggregated(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 
 	unaggregated1MonthRetention := client.NewMockSession(ctrl)
@@ -356,12 +383,14 @@ func TestLocalReadExceedsAggregatedButNotUnaggregatedAndPartialAggregated(t *tes
 
 	session := unaggregated1MonthRetention
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2),
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	session = aggregatedPartial6MonthRetention1MinuteResolution
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(encoding.EmptySeriesIterators, true, nil)
+		Return(encoding.EmptySeriesIterators,
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	// Test searching past unaggregated namespace and verify that we fan out to both
@@ -369,13 +398,13 @@ func TestLocalReadExceedsAggregatedButNotUnaggregatedAndPartialAggregated(t *tes
 	searchReq := newFetchReq()
 	searchReq.Start = time.Now().Add(-2 * test1MonthRetention)
 	searchReq.End = time.Now()
-	results, err := store.Fetch(context.TODO(), searchReq, buildFetchOpts())
+	results, err := store.FetchProm(context.TODO(), searchReq, buildFetchOpts())
 	require.NoError(t, err)
 	assertFetchResult(t, results, testTag)
 }
 
 func TestLocalReadExceedsAggregatedAndPartialAggregated(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 
 	unaggregated1MonthRetention := client.NewMockSession(ctrl)
@@ -406,43 +435,43 @@ func TestLocalReadExceedsAggregatedAndPartialAggregated(t *testing.T) {
 
 	session := aggregated3MonthRetention5MinuteResolution
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2), true, nil)
+		Return(seriesiter.NewMockSeriesIters(ctrl, testTag, 1, 2),
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	session = aggregatedPartial6MonthRetention1MinuteResolution
 	session.EXPECT().FetchTagged(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(encoding.EmptySeriesIterators, true, nil)
+		Return(encoding.EmptySeriesIterators,
+			testFetchResponseMetadata, nil)
 	session.EXPECT().IteratorPools().Return(newTestIteratorPools(ctrl), nil).AnyTimes()
 
 	// Test searching past aggregated and partially aggregated namespace, fan out to both
 	searchReq := newFetchReq()
 	searchReq.Start = time.Now().Add(-2 * test6MonthRetention)
 	searchReq.End = time.Now()
-	results, err := store.Fetch(context.TODO(), searchReq, buildFetchOpts())
+	results, err := store.FetchProm(context.TODO(), searchReq, buildFetchOpts())
 	require.NoError(t, err)
 	assertFetchResult(t, results, testTag)
 }
 
-func assertFetchResult(t *testing.T, results *storage.FetchResult, testTag ident.Tag) {
-	tags := []models.Tag{{
-		Name:  testTag.Name.Bytes(),
-		Value: testTag.Value.Bytes(),
-	}}
-
-	require.NotNil(t, results)
-	require.NotNil(t, results.SeriesList)
-	require.Len(t, results.SeriesList, 1)
-	require.NotNil(t, results.SeriesList[0])
-	assert.Equal(t, tags, results.SeriesList[0].Tags.Tags)
+func assertFetchResult(t *testing.T, results storage.PromResult, testTag ident.Tag) {
+	require.NotNil(t, results.PromResult)
+	series := results.PromResult.GetTimeseries()
+	require.Equal(t, 1, len(series))
+	labels := series[0].GetLabels()
+	require.Equal(t, 1, len(labels))
+	l := labels[0]
+	assert.Equal(t, testTag.Name.String(), string(l.GetName()))
+	assert.Equal(t, testTag.Value.String(), string(l.GetValue()))
 }
 
 func TestLocalSearchError(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 	sessions.forEach(func(session *client.MockSession) {
 		session.EXPECT().FetchTaggedIDs(gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(nil, false, fmt.Errorf("an error"))
+			Return(nil, client.FetchResponseMetadata{Exhaustive: false}, fmt.Errorf("an error"))
 		session.EXPECT().IteratorPools().
 			Return(nil, nil).AnyTimes()
 	})
@@ -453,7 +482,7 @@ func TestLocalSearchError(t *testing.T) {
 }
 
 func TestLocalSearchSuccess(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 
@@ -511,7 +540,7 @@ func TestLocalSearchSuccess(t *testing.T) {
 				iter.EXPECT().Finalize(),
 			)
 			session.EXPECT().FetchTaggedIDs(gomock.Any(), gomock.Any(), gomock.Any()).
-				Return(iter, true, nil)
+				Return(iter, testFetchResponseMetadata, nil)
 			session.EXPECT().IteratorPools().
 				Return(nil, nil).AnyTimes()
 			return
@@ -534,7 +563,7 @@ func TestLocalSearchSuccess(t *testing.T) {
 		)
 
 		session.EXPECT().FetchTaggedIDs(gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(iter, true, nil)
+			Return(iter, testFetchResponseMetadata, nil)
 
 		session.EXPECT().IteratorPools().
 			Return(nil, nil).AnyTimes()
@@ -600,7 +629,7 @@ func newCompleteTagsReq() *storage.CompleteTagsQuery {
 }
 
 func TestLocalCompleteTagsSuccess(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 	store, sessions := setup(t, ctrl)
 
@@ -649,7 +678,7 @@ func TestLocalCompleteTagsSuccess(t *testing.T) {
 				iter.EXPECT().Finalize(),
 			)
 			session.EXPECT().Aggregate(gomock.Any(), gomock.Any(), gomock.Any()).
-				Return(iter, true, nil)
+				Return(iter, testFetchResponseMetadata, nil)
 			return
 		}
 
@@ -667,7 +696,7 @@ func TestLocalCompleteTagsSuccess(t *testing.T) {
 		)
 
 		session.EXPECT().Aggregate(gomock.Any(), gomock.Any(), gomock.Any()).
-			Return(iter, true, nil)
+			Return(iter, testFetchResponseMetadata, nil)
 	})
 
 	req := newCompleteTagsReq()
@@ -696,7 +725,7 @@ func TestLocalCompleteTagsSuccess(t *testing.T) {
 }
 
 func TestLocalCompleteTagsSuccessFinalize(t *testing.T) {
-	ctrl := gomock.NewController(t)
+	ctrl := xtest.NewController(t)
 	defer ctrl.Finish()
 
 	unagg := client.NewMockSession(ctrl)
@@ -727,7 +756,7 @@ func TestLocalCompleteTagsSuccessFinalize(t *testing.T) {
 	)
 
 	unagg.EXPECT().Aggregate(gomock.Any(), gomock.Any(), gomock.Any()).
-		Return(iter, true, nil)
+		Return(iter, testFetchResponseMetadata, nil)
 
 	req := newCompleteTagsReq()
 	result, err := store.CompleteTags(context.TODO(), req, buildFetchOpts())
@@ -749,4 +778,18 @@ func TestLocalCompleteTagsSuccessFinalize(t *testing.T) {
 	n, v := result.CompletedTags[0].Name, result.CompletedTags[0].Values[0]
 	assert.False(t, bytetest.ByteSlicesBackedBySameData(name.Bytes(), n))
 	assert.False(t, bytetest.ByteSlicesBackedBySameData(value.Bytes(), v))
+}
+
+func TestInvalidBlockTypes(t *testing.T) {
+	opts := m3db.NewOptions()
+	s, err := NewStorage(nil, opts, instrument.NewOptions())
+	require.NoError(t, err)
+
+	fetchOpts := &storage.FetchOptions{BlockType: models.TypeDecodedBlock}
+	_, err = s.FetchBlocks(context.TODO(), nil, fetchOpts)
+	assert.Error(t, err)
+
+	fetchOpts.BlockType = models.TypeMultiBlock
+	_, err = s.FetchBlocks(context.TODO(), nil, fetchOpts)
+	assert.Error(t, err)
 }

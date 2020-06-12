@@ -26,8 +26,10 @@ import (
 	"time"
 
 	"github.com/m3db/m3/src/dbnode/clock"
+	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/storage/bootstrap/result"
 	"github.com/m3db/m3/src/dbnode/storage/index/compaction"
+	"github.com/m3db/m3/src/dbnode/storage/stats"
 	"github.com/m3db/m3/src/m3ninx/doc"
 	"github.com/m3db/m3/src/m3ninx/idx"
 	"github.com/m3db/m3/src/m3ninx/index/segment"
@@ -37,6 +39,7 @@ import (
 	"github.com/m3db/m3/src/x/context"
 	"github.com/m3db/m3/src/x/ident"
 	"github.com/m3db/m3/src/x/instrument"
+	"github.com/m3db/m3/src/x/mmap"
 	"github.com/m3db/m3/src/x/pool"
 	"github.com/m3db/m3/src/x/resource"
 	xtime "github.com/m3db/m3/src/x/time"
@@ -74,11 +77,18 @@ type Query struct {
 	idx.Query
 }
 
-// QueryOptions enables users to specify constraints on query execution.
+// QueryOptions enables users to specify constraints and
+// preferences on query execution.
 type QueryOptions struct {
-	StartInclusive time.Time
-	EndExclusive   time.Time
-	Limit          int
+	StartInclusive   time.Time
+	EndExclusive     time.Time
+	Limit            int
+	IterationOptions IterationOptions
+}
+
+// IterationOptions enables users to specify iteration preferences.
+type IterationOptions struct {
+	SeriesIteratorConsolidator encoding.SeriesIteratorConsolidator
 }
 
 // LimitExceeded returns whether a given size exceeds the limit
@@ -115,6 +125,9 @@ type BaseResults interface {
 
 	// Size returns the number of IDs tracked.
 	Size() int
+
+	// TotalDocsCount returns the total number of documents observed.
+	TotalDocsCount() int
 
 	// AddDocuments adds the batch of documents to the results set, it will
 	// take a copy of the bytes backing the documents so the original can be
@@ -325,7 +338,7 @@ type Block interface {
 	) (exhaustive bool, err error)
 
 	// AddResults adds bootstrap results to the block.
-	AddResults(results result.IndexBlock) error
+	AddResults(resultsByVolumeType result.IndexBlockByVolumeType) error
 
 	// Tick does internal house keeping operations.
 	Tick(c context.Cancellable) (BlockTickResult, error)
@@ -351,6 +364,21 @@ type Block interface {
 	// It is expected that results have been added to the block that covers any
 	// data the mutable segments should have held at this time.
 	EvictMutableSegments() error
+
+	// NeedsMutableSegmentsEvicted returns whether this block has any cold mutable segments
+	// that are not-empty and sealed.
+	NeedsColdMutableSegmentsEvicted() bool
+
+	// EvictMutableSegments closes any stale cold mutable segments up to the currently active
+	// cold mutable segment (the one we are actively writing to).
+	EvictColdMutableSegments() error
+
+	// RotateColdMutableSegments rotates the currently active cold mutable segment out for a
+	// new cold mutable segment to write to.
+	RotateColdMutableSegments()
+
+	// MemorySegmentsData returns all in memory segments data.
+	MemorySegmentsData(ctx context.Context) ([]fst.SegmentData, error)
 
 	// Close will release any held resources and close the Block.
 	Close() error
@@ -698,11 +726,11 @@ func (b *WriteBatch) Less(i, j int) bool {
 		panic(fmt.Errorf("unexpected sort by: %d", b.sortBy))
 	}
 
-	if b.entries[i].OnIndexSeries != nil && b.entries[j].OnIndexSeries == nil {
-		// This other entry has already been marked and this hasn't
+	if !b.entries[i].result.Done && b.entries[j].result.Done {
+		// This entry has been marked done and the other this hasn't
 		return true
 	}
-	if b.entries[i].OnIndexSeries == nil && b.entries[j].OnIndexSeries != nil {
+	if b.entries[i].result.Done && !b.entries[j].result.Done {
 		// This entry has already been marked and other hasn't
 		return false
 	}
@@ -892,4 +920,16 @@ type Options interface {
 
 	// ForwardIndexProbability returns the threshold for forward writes.
 	ForwardIndexThreshold() float64
+
+	// SetMmapReporter sets the mmap reporter.
+	SetMmapReporter(mmapReporter mmap.Reporter) Options
+
+	// MmapReporter returns the mmap reporter.
+	MmapReporter() mmap.Reporter
+
+	// SetQueryStatsTracker sets current query stats.
+	SetQueryStats(value stats.QueryStats) Options
+
+	// QueryStats returns the current query stats.
+	QueryStats() stats.QueryStats
 }

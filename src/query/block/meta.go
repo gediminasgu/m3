@@ -83,12 +83,12 @@ func combineResolutions(a, b []int64) []int64 {
 	} else {
 		if len(b) == 0 {
 			return a
-		} else {
-			combined := make([]int64, 0, len(a)+len(b))
-			combined = append(combined, a...)
-			combined = append(combined, b...)
-			return combined
 		}
+
+		combined := make([]int64, 0, len(a)+len(b))
+		combined = append(combined, a...)
+		combined = append(combined, b...)
+		return combined
 	}
 
 	return nil
@@ -102,11 +102,11 @@ func combineWarnings(a, b Warnings) Warnings {
 	} else {
 		if len(b) == 0 {
 			return a
-		} else {
-			combinedWarnings := make(Warnings, 0, len(a)+len(b))
-			combinedWarnings = append(combinedWarnings, a...)
-			return combinedWarnings.addWarnings(b...)
 		}
+
+		combinedWarnings := make(Warnings, 0, len(a)+len(b))
+		combinedWarnings = append(combinedWarnings, a...)
+		return combinedWarnings.addWarnings(b...)
 	}
 
 	return nil
@@ -157,6 +157,25 @@ func (w Warnings) addWarnings(warnings ...Warning) Warnings {
 	}
 
 	return w
+}
+
+// WarningStrings converts warnings to a slice of strings for presentation.
+func (m ResultMetadata) WarningStrings() []string {
+	size := len(m.Warnings)
+	if !m.Exhaustive {
+		size++
+	}
+
+	strs := make([]string, 0, size)
+	for _, warn := range m.Warnings {
+		strs = append(strs, warn.Header())
+	}
+
+	if !m.Exhaustive {
+		strs = append(strs, "m3db exceeded query limit: results not exhaustive")
+	}
+
+	return strs
 }
 
 // Warning is a message that indicates potential partial or incomplete results.

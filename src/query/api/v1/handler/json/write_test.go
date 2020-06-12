@@ -22,7 +22,6 @@ package json
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -30,8 +29,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/m3db/m3/src/query/api/v1/options"
+	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/test/m3"
-	"github.com/m3db/m3/src/x/instrument"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
@@ -45,8 +45,7 @@ func TestFailingJSONWriteParsing(t *testing.T) {
 					}`
 
 	req, _ := http.NewRequest("POST", WriteJSONURL, strings.NewReader(badJSON))
-	jsonWrite := &WriteJSONHandler{store: nil}
-	_, err := jsonWrite.parseRequest(req)
+	_, err := parseRequest(req)
 	require.Error(t, err)
 }
 
@@ -59,13 +58,10 @@ func generateJSONWriteRequest() string {
 }
 
 func TestJSONWriteParsing(t *testing.T) {
-	jsonWrite := NewWriteJSONHandler(nil,
-		instrument.NewOptions()).(*WriteJSONHandler)
-
 	jsonReq := generateJSONWriteRequest()
 	req := httptest.NewRequest("POST", WriteJSONURL, strings.NewReader(jsonReq))
 
-	r, err := jsonWrite.parseRequest(req)
+	r, err := parseRequest(req)
 	require.Nil(t, err, "unable to parse request")
 	require.Equal(t, 10.0, r.Value)
 	require.Equal(t, map[string]string{"tag_one": "val_one", "tag_two": "val_two"}, r.Tags)
@@ -83,22 +79,20 @@ func TestJSONWrite(t *testing.T) {
 	session.EXPECT().IteratorPools().
 		Return(nil, nil).AnyTimes()
 
-	jsonWrite := NewWriteJSONHandler(storage,
-		instrument.NewOptions()).(*WriteJSONHandler)
+	opts := options.EmptyHandlerOptions().
+		SetTagOptions(models.NewTagOptions()).
+		SetStorage(storage)
+	handler := NewWriteJSONHandler(opts).(*WriteJSONHandler)
 
 	jsonReq := generateJSONWriteRequest()
 	req, err := http.NewRequest(JSONWriteHTTPMethod, WriteJSONURL,
 		strings.NewReader(jsonReq))
 	require.NoError(t, err)
 
-	r, rErr := jsonWrite.parseRequest(req)
-	require.Nil(t, rErr, "unable to parse request")
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
 
-	writeQuery, err := newStorageWriteQuery(r)
-	require.NoError(t, err)
-
-	writeErr := jsonWrite.store.Write(context.TODO(), writeQuery)
-	require.NoError(t, writeErr)
+	require.Equal(t, http.StatusOK, resp.Code)
 }
 
 func TestJSONWriteError(t *testing.T) {
@@ -116,8 +110,8 @@ func TestJSONWriteError(t *testing.T) {
 	session.EXPECT().IteratorPools().
 		Return(nil, nil).AnyTimes()
 
-	jsonWrite := NewWriteJSONHandler(storage,
-		instrument.NewOptions()).(*WriteJSONHandler)
+	opts := options.EmptyHandlerOptions().SetStorage(storage)
+	jsonWrite := NewWriteJSONHandler(opts).(*WriteJSONHandler)
 
 	jsonReq := generateJSONWriteRequest()
 	req, err := http.NewRequest(JSONWriteHTTPMethod, WriteJSONURL,

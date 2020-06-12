@@ -31,11 +31,11 @@ import (
 	"github.com/m3db/m3/src/dbnode/environment"
 	"github.com/m3db/m3/src/dbnode/namespace"
 	"github.com/m3db/m3/src/dbnode/topology"
-	xtchannel "github.com/m3db/m3/src/dbnode/x/tchannel"
 	xerrors "github.com/m3db/m3/src/x/errors"
 	"github.com/m3db/m3/src/x/ident"
 	"github.com/m3db/m3/src/x/instrument"
 	"github.com/m3db/m3/src/x/retry"
+	"github.com/m3db/m3/src/x/sampler"
 	xsync "github.com/m3db/m3/src/x/sync"
 )
 
@@ -77,6 +77,9 @@ type Configuration struct {
 	// FetchRetry is the fetch retry config.
 	FetchRetry *retry.Configuration `yaml:"fetchRetry"`
 
+	// LogErrorSampleRate is the log error sample rate.
+	LogErrorSampleRate sampler.Rate `yaml:"logErrorSampleRate"`
+
 	// BackgroundHealthCheckFailLimit is the amount of times a background check
 	// must fail before a connection is taken out of consideration.
 	BackgroundHealthCheckFailLimit *int `yaml:"backgroundHealthCheckFailLimit"`
@@ -100,6 +103,9 @@ type Configuration struct {
 	// UseV2BatchAPIs determines whether the V2 batch APIs are used. Note that the M3DB nodes must
 	// have support for the V2 APIs in order for this feature to be used.
 	UseV2BatchAPIs *bool `yaml:"useV2BatchAPIs"`
+
+	// WriteTimestampOffset offsets all writes by specified duration into the past.
+	WriteTimestampOffset *time.Duration `yaml:"writeTimestampOffset"`
 }
 
 // ProtoConfiguration is the configuration for running with ProtoDataMode enabled.
@@ -157,6 +163,10 @@ func (c *Configuration) Validate() error {
 
 	if c.ConnectTimeout != nil && *c.ConnectTimeout < 0 {
 		return fmt.Errorf("m3db client connectTimeout was: %d but must be >= 0", *c.ConnectTimeout)
+	}
+
+	if err := c.LogErrorSampleRate.Validate(); err != nil {
+		return fmt.Errorf("m3db client error validating log error sample rate: %v", err)
 	}
 
 	if c.BackgroundHealthCheckFailLimit != nil &&
@@ -297,8 +307,8 @@ func (c Configuration) NewAdminClient(
 	v := NewAdminOptions().
 		SetTopologyInitializer(syncTopoInit).
 		SetAsyncTopologyInitializers(asyncTopoInits).
-		SetChannelOptions(xtchannel.NewDefaultChannelOptions()).
-		SetInstrumentOptions(iopts)
+		SetInstrumentOptions(iopts).
+		SetLogErrorSampleRate(c.LogErrorSampleRate)
 
 	if c.UseV2BatchAPIs != nil {
 		v = v.SetUseV2BatchAPIs(*c.UseV2BatchAPIs)
@@ -312,8 +322,10 @@ func (c Configuration) NewAdminClient(
 			size = *c.AsyncWriteWorkerPoolSize
 		}
 
+		workerPoolInstrumentOpts := iopts.SetMetricsScope(writeRequestScope.SubScope("workerpool"))
 		workerPoolOpts := xsync.NewPooledWorkerPoolOptions().
-			SetGrowOnDemand(true)
+			SetGrowOnDemand(true).
+			SetInstrumentOptions(workerPoolInstrumentOpts)
 		workerPool, err := xsync.NewPooledWorkerPool(size, workerPoolOpts)
 		if err != nil {
 			return nil, fmt.Errorf("unable to create async worker pool: %v", err)
@@ -352,9 +364,21 @@ func (c Configuration) NewAdminClient(
 	}
 	if c.WriteRetry != nil {
 		v = v.SetWriteRetrier(c.WriteRetry.NewRetrier(writeRequestScope))
+	} else {
+		// Have not set write retry explicitly, but would like metrics
+		// emitted for the write retrier with the scope for write requests.
+		retrierOpts := v.WriteRetrier().Options().
+			SetMetricsScope(writeRequestScope)
+		v = v.SetWriteRetrier(retry.NewRetrier(retrierOpts))
 	}
 	if c.FetchRetry != nil {
 		v = v.SetFetchRetrier(c.FetchRetry.NewRetrier(fetchRequestScope))
+	} else {
+		// Have not set fetch retry explicitly, but would like metrics
+		// emitted for the fetch retrier with the scope for fetch requests.
+		retrierOpts := v.FetchRetrier().Options().
+			SetMetricsScope(fetchRequestScope)
+		v = v.SetFetchRetrier(retry.NewRetrier(retrierOpts))
 	}
 	if syncClientOverrides.TargetHostQueueFlushSize != nil {
 		v = v.SetHostQueueOpsFlushSize(*syncClientOverrides.TargetHostQueueFlushSize)
@@ -391,6 +415,10 @@ func (c Configuration) NewAdminClient(
 	opts := v.(AdminOptions)
 	for _, opt := range custom {
 		opts = opt(opts)
+	}
+
+	if c.WriteTimestampOffset != nil {
+		opts = opts.SetWriteTimestampOffset(*c.WriteTimestampOffset)
 	}
 
 	asyncClusterOpts := NewOptionsForAsyncClusters(opts, asyncTopoInits, asyncClientOverrides)

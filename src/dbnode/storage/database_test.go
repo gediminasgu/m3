@@ -145,7 +145,7 @@ func newMockdatabase(ctrl *gomock.Controller, ns ...databaseNamespace) *Mockdata
 	db := NewMockdatabase(ctrl)
 	db.EXPECT().Options().Return(DefaultTestOptions()).AnyTimes()
 	if len(ns) != 0 {
-		db.EXPECT().GetOwnedNamespaces().Return(ns, nil).AnyTimes()
+		db.EXPECT().OwnedNamespaces().Return(ns, nil).AnyTimes()
 	}
 	return db
 }
@@ -355,7 +355,7 @@ func TestDatabaseNamespaces(t *testing.T) {
 	assert.Equal(t, "testns2", result[1].ID().String())
 }
 
-func TestGetOwnedNamespacesErrorIfClosed(t *testing.T) {
+func TestOwnedNamespacesErrorIfClosed(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -367,7 +367,7 @@ func TestGetOwnedNamespacesErrorIfClosed(t *testing.T) {
 	require.NoError(t, d.Open())
 	require.NoError(t, d.Terminate())
 
-	_, err := d.GetOwnedNamespaces()
+	_, err := d.OwnedNamespaces()
 	require.Equal(t, errDatabaseIsClosed, err)
 }
 
@@ -450,7 +450,7 @@ func TestDatabaseBootstrappedAssignShardSet(t *testing.T) {
 	ns := dbAddNewMockNamespace(ctrl, d, "testns")
 
 	mediator := NewMockdatabaseMediator(ctrl)
-	mediator.EXPECT().Bootstrap().Return(nil)
+	mediator.EXPECT().Bootstrap().Return(BootstrapResult{}, nil)
 	d.mediator = mediator
 
 	assert.NoError(t, d.Bootstrap())
@@ -464,7 +464,7 @@ func TestDatabaseBootstrappedAssignShardSet(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(1)
-	mediator.EXPECT().Bootstrap().Return(nil).Do(func() {
+	mediator.EXPECT().Bootstrap().Return(BootstrapResult{}, nil).Do(func() {
 		wg.Done()
 	})
 
@@ -782,7 +782,7 @@ func testDatabaseNamespaceIndexFunctions(t *testing.T, commitlogEnabled bool) {
 	nsOptions := namespace.NewOptions().
 		SetWritesToCommitLog(commitlogEnabled)
 
-	ns.EXPECT().GetOwnedShards().Return([]databaseShard{}).AnyTimes()
+	ns.EXPECT().OwnedShards().Return([]databaseShard{}).AnyTimes()
 	ns.EXPECT().Tick(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	ns.EXPECT().BootstrapState().Return(ShardBootstrapStates{}).AnyTimes()
 	ns.EXPECT().Options().Return(nsOptions).AnyTimes()
@@ -805,13 +805,13 @@ func testDatabaseNamespaceIndexFunctions(t *testing.T, commitlogEnabled bool) {
 	sp := mtr.StartSpan("root")
 	ctx.SetGoContext(opentracing.ContextWithSpan(stdlibctx.Background(), sp))
 
-	ns.EXPECT().WriteTagged(ctx, ident.NewIDMatcher("foo"), gomock.Any(),
+	ns.EXPECT().WriteTagged(gomock.Any(), ident.NewIDMatcher("foo"), gomock.Any(),
 		time.Time{}, 1.0, xtime.Second, nil).Return(s, true, nil)
 	require.NoError(t, d.WriteTagged(ctx, namespace,
 		id, tagsIter, time.Time{},
 		1.0, xtime.Second, nil))
 
-	ns.EXPECT().WriteTagged(ctx, ident.NewIDMatcher("foo"), gomock.Any(),
+	ns.EXPECT().WriteTagged(gomock.Any(), ident.NewIDMatcher("foo"), gomock.Any(),
 		time.Time{}, 1.0, xtime.Second, nil).Return(s, false, fmt.Errorf("random err"))
 	require.Error(t, d.WriteTagged(ctx, namespace,
 		ident.StringID("foo"), ident.EmptyTagIterator, time.Time{},
@@ -836,11 +836,11 @@ func testDatabaseNamespaceIndexFunctions(t *testing.T, commitlogEnabled bool) {
 	_, err = d.QueryIDs(ctx, ident.StringID("testns"), q, opts)
 	require.Error(t, err)
 
-	ns.EXPECT().AggregateQuery(ctx, q, aggOpts).Return(aggRes, nil)
+	ns.EXPECT().AggregateQuery(gomock.Any(), q, aggOpts).Return(aggRes, nil)
 	_, err = d.AggregateQuery(ctx, ident.StringID("testns"), q, aggOpts)
 	require.NoError(t, err)
 
-	ns.EXPECT().AggregateQuery(ctx, q, aggOpts).
+	ns.EXPECT().AggregateQuery(gomock.Any(), q, aggOpts).
 		Return(aggRes, fmt.Errorf("random err"))
 	_, err = d.AggregateQuery(ctx, ident.StringID("testns"), q, aggOpts)
 	require.Error(t, err)
@@ -853,10 +853,12 @@ func testDatabaseNamespaceIndexFunctions(t *testing.T, commitlogEnabled bool) {
 
 	sp.Finish()
 	spans := mtr.FinishedSpans()
-	require.Len(t, spans, 3)
+	require.Len(t, spans, 5)
 	assert.Equal(t, tracepoint.DBQueryIDs, spans[0].OperationName)
 	assert.Equal(t, tracepoint.DBQueryIDs, spans[1].OperationName)
-	assert.Equal(t, "root", spans[2].OperationName)
+	assert.Equal(t, tracepoint.DBAggregateQuery, spans[2].OperationName)
+	assert.Equal(t, tracepoint.DBAggregateQuery, spans[3].OperationName)
+	assert.Equal(t, "root", spans[4].OperationName)
 }
 
 func TestDatabaseWriteBatchNoNamespace(t *testing.T) {
@@ -876,7 +878,7 @@ func TestDatabaseWriteBatchNoNamespace(t *testing.T) {
 	_, err := d.BatchWriter(notExistNamespace, batchSize)
 	require.Error(t, err)
 
-	err = d.WriteBatch(nil, notExistNamespace, nil, nil)
+	err = d.WriteBatch(context.NewContext(), notExistNamespace, nil, nil)
 	require.Error(t, err)
 
 	require.NoError(t, d.Close())
@@ -899,7 +901,7 @@ func TestDatabaseWriteTaggedBatchNoNamespace(t *testing.T) {
 	_, err := d.BatchWriter(notExistNamespace, batchSize)
 	require.Error(t, err)
 
-	err = d.WriteTaggedBatch(nil, notExistNamespace, nil, nil)
+	err = d.WriteTaggedBatch(context.NewContext(), notExistNamespace, nil, nil)
 	require.Error(t, err)
 
 	require.NoError(t, d.Close())
@@ -962,7 +964,7 @@ func testDatabaseWriteBatch(t *testing.T,
 	nsOptions := namespace.NewOptions().
 		SetWritesToCommitLog(commitlogEnabled)
 
-	ns.EXPECT().GetOwnedShards().Return([]databaseShard{}).AnyTimes()
+	ns.EXPECT().OwnedShards().Return([]databaseShard{}).AnyTimes()
 	ns.EXPECT().Tick(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	ns.EXPECT().BootstrapState().Return(ShardBootstrapStates{}).AnyTimes()
 	ns.EXPECT().Options().Return(nsOptions).AnyTimes()
@@ -1172,123 +1174,6 @@ func TestDatabaseIsBootstrapped(t *testing.T) {
 	assert.False(t, d.IsBootstrapped())
 }
 
-func TestDatabaseIsBootstrappedAndDurable(t *testing.T) {
-	ctrl := gomock.NewController(t)
-	defer ctrl.Finish()
-
-	var (
-		validIsBootstrapped                  = true
-		validShardSetAssignedAt              = time.Now()
-		validLastBootstrapCompletionTime     = validShardSetAssignedAt.Add(time.Second)
-		validLastSuccessfulSnapshotStartTime = validLastBootstrapCompletionTime.Add(time.Second)
-	)
-	testCases := []struct {
-		title                           string
-		isBootstrapped                  bool
-		lastBootstrapCompletionTime     time.Time
-		lastSuccessfulSnapshotStartTime time.Time
-		shardSetAssignedAt              time.Time
-		expectedResult                  bool
-	}{
-		{
-			title:                           "False is not bootstrapped",
-			isBootstrapped:                  false,
-			lastBootstrapCompletionTime:     validLastBootstrapCompletionTime,
-			lastSuccessfulSnapshotStartTime: validLastSuccessfulSnapshotStartTime,
-			shardSetAssignedAt:              validShardSetAssignedAt,
-			expectedResult:                  false,
-		},
-		{
-			title:                           "False if no last bootstrap completion time",
-			isBootstrapped:                  validIsBootstrapped,
-			lastBootstrapCompletionTime:     time.Time{},
-			lastSuccessfulSnapshotStartTime: validLastSuccessfulSnapshotStartTime,
-			shardSetAssignedAt:              validShardSetAssignedAt,
-			expectedResult:                  false,
-		},
-		{
-			title:                           "False if no last successful snapshot start time",
-			isBootstrapped:                  validIsBootstrapped,
-			lastBootstrapCompletionTime:     validLastBootstrapCompletionTime,
-			lastSuccessfulSnapshotStartTime: time.Time{},
-			shardSetAssignedAt:              validShardSetAssignedAt,
-			expectedResult:                  false,
-		},
-		{
-			title:                           "False if last snapshot start is not after last bootstrap completion time",
-			isBootstrapped:                  validIsBootstrapped,
-			lastBootstrapCompletionTime:     validLastBootstrapCompletionTime,
-			lastSuccessfulSnapshotStartTime: validLastBootstrapCompletionTime,
-			shardSetAssignedAt:              validShardSetAssignedAt,
-			expectedResult:                  false,
-		},
-		{
-			title:                           "False if last bootstrap completion time is not after shardset assigned at time",
-			isBootstrapped:                  validIsBootstrapped,
-			lastBootstrapCompletionTime:     validLastBootstrapCompletionTime,
-			lastSuccessfulSnapshotStartTime: validLastBootstrapCompletionTime,
-			shardSetAssignedAt:              validLastBootstrapCompletionTime,
-			expectedResult:                  false,
-		},
-		{
-			title:                           "False if last bootstrap completion time is not after/equal shardset assigned at time",
-			isBootstrapped:                  validIsBootstrapped,
-			lastBootstrapCompletionTime:     validLastBootstrapCompletionTime,
-			lastSuccessfulSnapshotStartTime: validLastSuccessfulSnapshotStartTime,
-			shardSetAssignedAt:              validLastBootstrapCompletionTime.Add(time.Second),
-			expectedResult:                  false,
-		},
-		{
-			title:                           "True if all conditions are met",
-			isBootstrapped:                  validIsBootstrapped,
-			lastBootstrapCompletionTime:     validLastBootstrapCompletionTime,
-			lastSuccessfulSnapshotStartTime: validLastSuccessfulSnapshotStartTime,
-			shardSetAssignedAt:              validShardSetAssignedAt,
-			expectedResult:                  true,
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.title, func(t *testing.T) {
-			d, mapCh, _ := defaultTestDatabase(t, ctrl, Bootstrapped)
-			defer func() {
-				close(mapCh)
-			}()
-
-			mediator := NewMockdatabaseMediator(ctrl)
-			d.mediator = mediator
-			d.lastReceivedNewShards = tc.shardSetAssignedAt
-
-			mediator.EXPECT().IsBootstrapped().Return(tc.isBootstrapped)
-			if !tc.isBootstrapped {
-				assert.Equal(t, tc.expectedResult, d.IsBootstrappedAndDurable())
-				// Early return because other mock calls will not get called.
-				return
-			}
-
-			if tc.lastBootstrapCompletionTime.IsZero() {
-				mediator.EXPECT().LastBootstrapCompletionTime().Return(time.Time{}, false)
-				assert.Equal(t, tc.expectedResult, d.IsBootstrappedAndDurable())
-				// Early return because other mock calls will not get called.
-				return
-			}
-
-			mediator.EXPECT().LastBootstrapCompletionTime().Return(tc.lastBootstrapCompletionTime, true)
-
-			if tc.lastSuccessfulSnapshotStartTime.IsZero() {
-				mediator.EXPECT().LastSuccessfulSnapshotStartTime().Return(time.Time{}, false)
-				assert.Equal(t, tc.expectedResult, d.IsBootstrappedAndDurable())
-				// Early return because other mock calls will not get called.
-				return
-			}
-
-			mediator.EXPECT().LastSuccessfulSnapshotStartTime().Return(tc.lastSuccessfulSnapshotStartTime, true)
-
-			assert.Equal(t, tc.expectedResult, d.IsBootstrappedAndDurable())
-		})
-	}
-}
-
 func TestUpdateBatchWriterBasedOnShardResults(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -1304,7 +1189,7 @@ func TestUpdateBatchWriterBasedOnShardResults(t *testing.T) {
 	ns := dbAddNewMockNamespace(ctrl, d, "testns")
 	nsOptions := namespace.NewOptions().
 		SetWritesToCommitLog(false)
-	ns.EXPECT().GetOwnedShards().Return([]databaseShard{}).AnyTimes()
+	ns.EXPECT().OwnedShards().Return([]databaseShard{}).AnyTimes()
 	ns.EXPECT().Tick(gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
 	ns.EXPECT().BootstrapState().Return(ShardBootstrapStates{}).AnyTimes()
 	ns.EXPECT().Options().Return(nsOptions).AnyTimes()

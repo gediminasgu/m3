@@ -39,12 +39,14 @@ import (
 	"github.com/m3db/m3/src/dbnode/storage/index"
 	"github.com/m3db/m3/src/dbnode/storage/repair"
 	"github.com/m3db/m3/src/dbnode/storage/series"
+	"github.com/m3db/m3/src/dbnode/storage/series/lookup"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
 	"github.com/m3db/m3/src/dbnode/x/xpool"
 	"github.com/m3db/m3/src/x/context"
 	"github.com/m3db/m3/src/x/ident"
 	"github.com/m3db/m3/src/x/instrument"
+	"github.com/m3db/m3/src/x/mmap"
 	"github.com/m3db/m3/src/x/pool"
 	xsync "github.com/m3db/m3/src/x/sync"
 	xtime "github.com/m3db/m3/src/x/time"
@@ -217,36 +219,45 @@ type Database interface {
 	FlushState(namespace ident.ID, shardID uint32, blockStart time.Time) (fileOpState, error)
 }
 
-// database is the internal database interface
+// database is the internal database interface.
 type database interface {
 	Database
 
-	// GetOwnedNamespaces returns the namespaces this database owns.
-	GetOwnedNamespaces() ([]databaseNamespace, error)
+	// OwnedNamespaces returns the namespaces this database owns.
+	OwnedNamespaces() ([]databaseNamespace, error)
 
 	// UpdateOwnedNamespaces updates the namespaces this database owns.
 	UpdateOwnedNamespaces(namespaces namespace.Map) error
 }
 
-// Namespace is a time series database namespace
+// Namespace is a time series database namespace.
 type Namespace interface {
-	// Options returns the namespace options
+	// Options returns the namespace options.
 	Options() namespace.Options
 
-	// ID returns the ID of the namespace
+	// ID returns the ID of the namespace.
 	ID() ident.ID
+
+	// Metadata returns the metadata of the namespace.
+	Metadata() namespace.Metadata
 
 	// Schema returns the schema of the namespace.
 	Schema() namespace.SchemaDescr
 
-	// NumSeries returns the number of series in the namespace
+	// NumSeries returns the number of series in the namespace.
 	NumSeries() int64
 
-	// Shards returns the shard description
+	// Shards returns the shard description.
 	Shards() []Shard
+
+	// Index returns the reverse index backing the namespace, if it exists.
+	Index() (NamespaceIndex, error)
+
+	// StorageOptions returns storage options.
+	StorageOptions() Options
 }
 
-// NamespacesByID is a sortable slice of namespaces by ID
+// NamespacesByID is a sortable slice of namespaces by ID.
 type NamespacesByID []Namespace
 
 func (n NamespacesByID) Len() int      { return len(n) }
@@ -264,11 +275,8 @@ type databaseNamespace interface {
 	// AssignShardSet sets the shard set assignment and returns immediately.
 	AssignShardSet(shardSet sharding.ShardSet)
 
-	// GetOwnedShards returns the database shards.
-	GetOwnedShards() []databaseShard
-
-	// GetIndex returns the reverse index backing the namespace, if it exists.
-	GetIndex() (namespaceIndex, error)
+	// OwnedShards returns the database shards.
+	OwnedShards() []databaseShard
 
 	// Tick performs any regular maintenance operations.
 	Tick(c context.Cancellable, startTime time.Time) error
@@ -334,8 +342,13 @@ type databaseNamespace interface {
 		opts block.FetchBlocksMetadataOptions,
 	) (block.FetchBlocksMetadataResults, PageToken, error)
 
-	// Bootstrap performs bootstrapping.
-	Bootstrap(start time.Time, process bootstrap.Process) error
+	// PrepareBootstrap prepares the namespace for bootstrapping by ensuring
+	// it's shards know which flushed files reside on disk, so that calls
+	// to series.LoadBlock(...) will succeed.
+	PrepareBootstrap(ctx context.Context) ([]databaseShard, error)
+
+	// Bootstrap marks shards as bootstrapped for the namespace.
+	Bootstrap(ctx context.Context, bootstrapResult bootstrap.NamespaceResult) error
 
 	// WarmFlush flushes in-memory WarmWrites.
 	WarmFlush(blockStart time.Time, flush persist.FlushPreparer) error
@@ -370,6 +383,30 @@ type databaseNamespace interface {
 
 	// FlushState returns the flush state for the specified shard and block start.
 	FlushState(shardID uint32, blockStart time.Time) (fileOpState, error)
+
+	// SeriesReadWriteRef returns a read/write ref to a series, callers
+	// must make sure to call the release callback once finished
+	// with the reference.
+	SeriesReadWriteRef(
+		shardID uint32,
+		id ident.ID,
+		tags ident.TagIterator,
+	) (result SeriesReadWriteRef, owned bool, err error)
+}
+
+// SeriesReadWriteRef is a read/write reference for a series,
+// must make sure to release
+type SeriesReadWriteRef struct {
+	// Series reference for read/writing.
+	Series series.DatabaseSeries
+	// UniqueIndex is the unique index of the series (as applicable).
+	UniqueIndex uint64
+	// Shard is the shard of the series.
+	Shard uint32
+	// ReleaseReadWriteRef must be called after using the series ref
+	// to release the reference count to the series so it can
+	// be expired by the owning shard eventually.
+	ReleaseReadWriteRef lookup.OnReleaseReadWriteRef
 }
 
 // Shard is a time series database shard.
@@ -401,6 +438,7 @@ type databaseShard interface {
 	// Tick performs all async updates
 	Tick(c context.Cancellable, startTime time.Time, nsCtx namespace.Context) (tickResult, error)
 
+	// Write writes a value to the shard for an ID.
 	Write(
 		ctx context.Context,
 		id ident.ID,
@@ -411,7 +449,7 @@ type databaseShard interface {
 		wOpts series.WriteOptions,
 	) (ts.Series, bool, error)
 
-	// WriteTagged values to the shard for an ID.
+	// WriteTagged writes a value to the shard for an ID with tags.
 	WriteTagged(
 		ctx context.Context,
 		id ident.ID,
@@ -448,7 +486,7 @@ type databaseShard interface {
 		start time.Time,
 		version int,
 		nsCtx namespace.Context,
-	) ([]xio.BlockReader, error)
+	) (block.FetchBlockResult, error)
 
 	// FetchBlocksMetadataV2 retrieves blocks metadata.
 	FetchBlocksMetadataV2(
@@ -459,14 +497,22 @@ type databaseShard interface {
 		opts block.FetchBlocksMetadataOptions,
 	) (block.FetchBlocksMetadataResults, PageToken, error)
 
-	// Bootstrap bootstraps the shard with provided data.
-	Bootstrap(
-		bootstrappedSeries *result.Map,
-	) error
+	// PrepareBootstrap prepares the shard for bootstrapping by ensuring
+	// it knows which flushed files reside on disk.
+	PrepareBootstrap(ctx context.Context) error
 
-	// Load does the same thing as Bootstrap, except it can be called more than once
-	// and after a shard is bootstrapped already.
-	Load(series *result.Map) error
+	// Bootstrap bootstraps the shard after all provided data
+	// has been loaded using LoadBootstrapBlocks.
+	Bootstrap(ctx context.Context) error
+
+	// UpdateFlushStates updates all the flush states for the current shard
+	// by checking the file volumes that exist on disk at a point in time.
+	UpdateFlushStates()
+
+	// LoadBlocks does the same thing as LoadBootstrapBlocks,
+	// except it can be called more than once and after a shard is
+	// bootstrapped already.
+	LoadBlocks(series *result.Map) error
 
 	// WarmFlush flushes the WarmWrites in this shard.
 	WarmFlush(
@@ -480,6 +526,7 @@ type databaseShard interface {
 		flush persist.FlushPreparer,
 		resources coldFlushReuseableResources,
 		nsCtx namespace.Context,
+		onFlush persist.OnFlushSeries,
 	) error
 
 	// Snapshot snapshot's the unflushed WarmWrites in this shard.
@@ -511,11 +558,28 @@ type databaseShard interface {
 	) (repair.MetadataComparisonResult, error)
 
 	// TagsFromSeriesID returns the series tags from a series ID.
+	// TODO(r): Seems like this is a work around that shouldn't be
+	// necessary given the callsites that current exist?
 	TagsFromSeriesID(seriesID ident.ID) (ident.Tags, bool, error)
+
+	// SeriesReadWriteRef returns a read/write ref to a series, callers
+	// must make sure to call the release callback once finished
+	// with the reference.
+	SeriesReadWriteRef(
+		id ident.ID,
+		tags ident.TagIterator,
+		opts ShardSeriesReadWriteRefOptions,
+	) (SeriesReadWriteRef, error)
 }
 
-// namespaceIndex indexes namespace writes.
-type namespaceIndex interface {
+// ShardSeriesReadWriteRefOptions are options for SeriesReadWriteRef
+// for the shard.
+type ShardSeriesReadWriteRefOptions struct {
+	ReverseIndex bool
+}
+
+// NamespaceIndex indexes namespace writes.
+type NamespaceIndex interface {
 	// AssignShardSet sets the shard set assignment and returns immediately.
 	AssignShardSet(shardSet sharding.ShardSet)
 
@@ -524,6 +588,11 @@ type namespaceIndex interface {
 	BlockStartForWriteTime(
 		writeTime time.Time,
 	) xtime.UnixNano
+
+	// BlockForBlockStart returns an index block for a block start.
+	BlockForBlockStart(
+		blockStart time.Time,
+	) (index.Block, error)
 
 	// WriteBatch indexes the provided entries.
 	WriteBatch(
@@ -556,19 +625,38 @@ type namespaceIndex interface {
 	// using the provided `t` as the frame of reference.
 	CleanupExpiredFileSets(t time.Time) error
 
+	// CleanupDuplicateFileSets removes duplicate fileset files.
+	CleanupDuplicateFileSets() error
+
 	// Tick performs internal house keeping in the index, including block rotation,
 	// data eviction, and so on.
 	Tick(c context.Cancellable, startTime time.Time) (namespaceIndexTickResult, error)
 
-	// Flush performs any flushes that the index has outstanding using
+	// WarmFlush performs any warm flushes that the index has outstanding using
 	// the owned shards of the database.
-	Flush(
+	WarmFlush(
 		flush persist.IndexFlush,
 		shards []databaseShard,
 	) error
 
+	// ColdFlush performs any cold flushes that the index has outstanding using
+	// the owned shards of the database. Also returns a callback to be called when
+	// cold flushing completes to perform houskeeping.
+	ColdFlush(shards []databaseShard) (OnColdFlushDone, error)
+
+	// DebugMemorySegments allows for debugging memory segments.
+	DebugMemorySegments(opts DebugMemorySegmentsOptions) error
+
 	// Close will release the index resources and close the index.
 	Close() error
+}
+
+// OnColdFlushDone is a callback that performs house keeping once cold flushing completes.
+type OnColdFlushDone func() error
+
+// DebugMemorySegmentsOptions is a set of options to debug memory segments.
+type DebugMemorySegmentsOptions struct {
+	OutputDirectory string
 }
 
 // namespaceIndexTickResult are details about the work performed by the namespaceIndex
@@ -607,10 +695,16 @@ type databaseBootstrapManager interface {
 	LastBootstrapCompletionTime() (time.Time, bool)
 
 	// Bootstrap performs bootstrapping for all namespaces and shards owned.
-	Bootstrap() error
+	Bootstrap() (BootstrapResult, error)
 
 	// Report reports runtime information.
 	Report()
+}
+
+// BootstrapResult is a bootstrap result.
+type BootstrapResult struct {
+	ErrorsBootstrap      []error
+	AlreadyBootstrapping bool
 }
 
 // databaseFlushManager manages flushing in-memory data to persistent storage.
@@ -629,7 +723,7 @@ type databaseFlushManager interface {
 // databaseCleanupManager manages cleaning up persistent storage space.
 type databaseCleanupManager interface {
 	// Cleanup cleans up data not needed in the persistent storage.
-	Cleanup(t time.Time) error
+	Cleanup(t time.Time, isBootstrapped bool) error
 
 	// Report reports runtime information.
 	Report()
@@ -638,7 +732,7 @@ type databaseCleanupManager interface {
 // databaseFileSystemManager manages the database related filesystem activities.
 type databaseFileSystemManager interface {
 	// Cleanup cleans up data not needed in the persistent storage.
-	Cleanup(t time.Time) error
+	Cleanup(t time.Time, isBootstrapped bool) error
 
 	// Flush flushes in-memory data to persistent storage.
 	Flush(t time.Time) error
@@ -720,7 +814,7 @@ type databaseMediator interface {
 	LastBootstrapCompletionTime() (time.Time, bool)
 
 	// Bootstrap bootstraps the database with file operations performed at the end.
-	Bootstrap() error
+	Bootstrap() (BootstrapResult, error)
 
 	// DisableFileOps disables file operations.
 	DisableFileOps()
@@ -730,6 +824,9 @@ type databaseMediator interface {
 
 	// Tick performs a tick.
 	Tick(forceType forceType, startTime time.Time) error
+
+	// WaitForFileSystemProcesses waits for any ongoing fs processes to finish.
+	WaitForFileSystemProcesses()
 
 	// Repair repairs the database.
 	Repair() error
@@ -743,6 +840,17 @@ type databaseMediator interface {
 	// LastSuccessfulSnapshotStartTime returns the start time of the last
 	// successful snapshot, if any.
 	LastSuccessfulSnapshotStartTime() (time.Time, bool)
+}
+
+// OnColdFlush can perform work each time a series is flushed.
+type OnColdFlush interface {
+	ColdFlushNamespace(ns Namespace) (OnColdFlushNamespace, error)
+}
+
+// OnColdFlushNamespace performs work on a per namespace level.
+type OnColdFlushNamespace interface {
+	persist.OnFlushSeries
+	Done() error
 }
 
 // Options represents the options for storage.
@@ -982,11 +1090,31 @@ type Options interface {
 	// BlockLeaseManager returns the block leaser.
 	BlockLeaseManager() block.LeaseManager
 
+	// SetOnColdFlush sets the on cold flush processor.
+	SetOnColdFlush(value OnColdFlush) Options
+
+	// OnColdFlush returns the on cold flush processor.
+	OnColdFlush() OnColdFlush
+
 	// SetMemoryTracker sets the MemoryTracker.
 	SetMemoryTracker(memTracker MemoryTracker) Options
 
 	// MemoryTracker returns the MemoryTracker.
 	MemoryTracker() MemoryTracker
+
+	// SetMmapReporter sets the mmap reporter.
+	SetMmapReporter(mmapReporter mmap.Reporter) Options
+
+	// MmapReporter returns the mmap reporter.
+	MmapReporter() mmap.Reporter
+
+	// SetDoNotIndexWithFieldsMap sets a map which if fields match it
+	// will not index those metrics.
+	SetDoNotIndexWithFieldsMap(value map[string]string) Options
+
+	// DoNotIndexWithFieldsMap returns a map which if fields match it
+	// will not index those metrics.
+	DoNotIndexWithFieldsMap() map[string]string
 }
 
 // MemoryTracker tracks memory.

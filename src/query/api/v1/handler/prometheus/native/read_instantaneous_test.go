@@ -30,10 +30,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/test"
+	xjson "github.com/m3db/m3/src/x/json"
 	xtest "github.com/m3db/m3/src/x/test"
 
 	"github.com/stretchr/testify/assert"
@@ -79,21 +80,23 @@ func (v vectorResultValues) parse() (time.Time, int, error) {
 }
 
 func TestPromReadInstantHandler(t *testing.T) {
-	testPromReadInstantHandler(t, block.NewResultMetadata(), "")
-	testPromReadInstantHandler(t, buildWarningMeta("foo", "bar"), "foo_bar")
+	testPromReadInstantHandler(t, block.NewResultMetadata(), "", "")
+	testPromReadInstantHandler(t, buildWarningMeta("foo", "bar"), "foo_bar", "foo_bar")
 	testPromReadInstantHandler(t, block.ResultMetadata{Exhaustive: false},
-		handler.LimitHeaderSeriesLimitApplied)
+		handleroptions.LimitHeaderSeriesLimitApplied,
+		"m3db exceeded query limit: results not exhaustive")
 }
 
 func testPromReadInstantHandler(
 	t *testing.T,
 	resultMeta block.ResultMetadata,
 	ex string,
+	jsonWarning string,
 ) {
 	values, bounds := test.GenerateValuesAndBounds(nil, nil)
 
 	setup := newTestSetup()
-	promReadInstant := setup.Handlers.InstantRead
+	promReadInstant := setup.Handlers.instantRead
 
 	seriesMeta := test.NewSeriesMeta("dummy", len(values))
 	meta := block.Metadata{
@@ -106,7 +109,7 @@ func testPromReadInstantHandler(
 	test.NewBlockFromValues(bounds, values)
 	setup.Storage.SetFetchBlocksResult(block.Result{Blocks: []block.Block{b}}, nil)
 
-	req := httptest.NewRequest(PromReadInstantHTTPMethod, PromReadInstantURL, nil)
+	req := httptest.NewRequest(PromReadInstantHTTPMethods[0], PromReadInstantURL, nil)
 
 	params := url.Values{}
 	params.Set(queryParam, "dummy0{}")
@@ -118,7 +121,7 @@ func testPromReadInstantHandler(
 
 	require.Equal(t, http.StatusOK, recorder.Result().StatusCode)
 
-	header := recorder.Header().Get(handler.LimitHeader)
+	header := recorder.Header().Get(handleroptions.LimitHeader)
 	assert.Equal(t, ex, header)
 
 	var result vectorResult
@@ -130,48 +133,52 @@ func testPromReadInstantHandler(
 	at1, value1, err := result.Data.Result[1].Value.parse()
 	require.NoError(t, err)
 
-	expected := mustPrettyJSON(t, fmt.Sprintf(`
-	{
+	expectedResp := xjson.Map{
 		"status": "success",
-		"data": {
+		"data": xjson.Map{
 			"resultType": "vector",
-			"result": [
-				{
-					"metric": {
+			"result": xjson.Array{
+				xjson.Map{
+					"metric": xjson.Map{
 						"__name__": "dummy0",
-						"dummy0": "dummy0"
+						"dummy0":   "dummy0",
 					},
-					"value": [
-						%d,
-						"%d"
-					]
+					"value": xjson.Array{
+						at0.Unix(),
+						strconv.Itoa(value0),
+					},
 				},
-				{
-					"metric": {
+				xjson.Map{
+					"metric": xjson.Map{
 						"__name__": "dummy1",
-						"dummy1": "dummy1"
+						"dummy1":   "dummy1",
 					},
-					"value": [
-						%d,
-						"%d"
-					]
-				}
-			]
-		}
+					"value": xjson.Array{
+						at1.Unix(),
+						strconv.Itoa(value1),
+					},
+				},
+			},
+		},
 	}
-	`, at0.Unix(), value0, at1.Unix(), value1))
-	actual := mustPrettyJSON(t, recorder.Body.String())
+
+	if len(jsonWarning) != 0 {
+		expectedResp["warnings"] = xjson.Array{jsonWarning}
+	}
+
+	expected := xtest.MustPrettyJSONMap(t, expectedResp)
+	actual := xtest.MustPrettyJSONString(t, recorder.Body.String())
 	assert.Equal(t, expected, actual, xtest.Diff(expected, actual))
 }
 
 func TestPromReadInstantHandlerStorageError(t *testing.T) {
 	setup := newTestSetup()
-	promReadInstant := setup.Handlers.InstantRead
+	promReadInstant := setup.Handlers.instantRead
 
 	storageErr := fmt.Errorf("storage err")
 	setup.Storage.SetFetchBlocksResult(block.Result{}, storageErr)
 
-	req := httptest.NewRequest(PromReadInstantHTTPMethod, PromReadInstantURL, nil)
+	req := httptest.NewRequest(PromReadInstantHTTPMethods[0], PromReadInstantURL, nil)
 
 	params := url.Values{}
 	params.Set(queryParam, "dummy0{}")

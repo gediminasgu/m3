@@ -34,7 +34,7 @@ function test_prometheus_remote_read {
   # Ensure Prometheus can proxy a Prometheus query
   echo "Wait until the remote write endpoint generates and allows for data to be queried"
   ATTEMPTS=50 TIMEOUT=2 MAX_TIMEOUT=4 retry_with_backoff  \
-    '[[ $(curl -sSf 0.0.0.0:9090/api/v1/query?query=prometheus_remote_storage_succeeded_samples_total | jq -r .data.result[].value[1]) -gt 100 ]]'
+    '[[ $(curl -sSf 0.0.0.0:9090/api/v1/query?query=prometheus_remote_storage_succeeded_samples_total | jq -r .data.result[0].value[1]) -gt 100 ]]'
 }
 
 function test_prometheus_remote_write_multi_namespaces {
@@ -85,7 +85,8 @@ function prometheus_remote_write {
 function test_prometheus_remote_write_too_old_returns_400_status_code {
   # Test writing too far into the past returns an HTTP 400 status code
   echo "Test write into the past returns HTTP 400"
-  hour_ago=$(expr $(date +"%s") - 3600) 
+  now=$(date +"%s")
+  hour_ago=$(( now - 3600 ))
   prometheus_remote_write \
     $METRIC_NAME_TEST_TOO_OLD $hour_ago 3.142 \
     false "Expected request to fail" \
@@ -147,7 +148,8 @@ function prometheus_query_native {
 
 function test_query_restrict_metrics_type {
   now=$(date +"%s")
-  hour_ago=$(expr $now - 3600) 
+  hour_ago=$(( now - 3600 ))
+
   step="30s"
   params_instant=""
   params_range="start=${hour_ago}"'&'"end=${now}"'&'"step=30s"

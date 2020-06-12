@@ -27,6 +27,8 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/util/logging"
 	"github.com/m3db/m3/src/x/instrument"
@@ -48,20 +50,16 @@ const (
 // SearchHandler represents a handler for the search endpoint
 type SearchHandler struct {
 	store               storage.Storage
-	fetchOptionsBuilder FetchOptionsBuilder
+	fetchOptionsBuilder handleroptions.FetchOptionsBuilder
 	instrumentOpts      instrument.Options
 }
 
 // NewSearchHandler returns a new instance of handler
-func NewSearchHandler(
-	storage storage.Storage,
-	fetchOptionsBuilder FetchOptionsBuilder,
-	instrumentOpts instrument.Options,
-) http.Handler {
+func NewSearchHandler(opts options.HandlerOptions) http.Handler {
 	return &SearchHandler{
-		store:               storage,
-		fetchOptionsBuilder: fetchOptionsBuilder,
-		instrumentOpts:      instrumentOpts,
+		store:               opts.Storage(),
+		fetchOptionsBuilder: opts.FetchOptionsBuilder(),
+		instrumentOpts:      opts.InstrumentOpts(),
 	}
 }
 
@@ -69,16 +67,19 @@ func (h *SearchHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger := logging.WithContext(r.Context(), h.instrumentOpts)
 
 	query, parseBodyErr := h.parseBody(r)
-	opts, parseURLParamsErr := h.parseURLParams(r)
+	fetchOpts, parseURLParamsErr := h.parseURLParams(r)
 	if err := firstParseError(parseBodyErr, parseURLParamsErr); err != nil {
 		logger.Error("unable to parse request", zap.Error(err.Inner()))
 		xhttp.Error(w, err.Inner(), err.Code())
 		return
 	}
 
-	results, err := h.search(r.Context(), query, opts)
+	results, err := h.search(r.Context(), query, fetchOpts)
 	if err != nil {
-		logger.Error("unable to fetch data", zap.Error(err))
+		logger.Error("search query error",
+			zap.Error(err),
+			zap.Any("query", query),
+			zap.Any("fetchOpts", fetchOpts))
 		xhttp.Error(w, err, http.StatusBadRequest)
 		return
 	}

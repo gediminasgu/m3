@@ -26,45 +26,84 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/m3db/m3/src/cmd/services/m3comparator/main/parser"
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/query/block"
-	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
 	"github.com/m3db/m3/src/query/storage/m3"
+	xtime "github.com/m3db/m3/src/x/time"
+
+	"github.com/prometheus/common/model"
 )
 
 var _ m3.Querier = (*querier)(nil)
 
 type querier struct {
-	encoderPool   encoding.EncoderPool
-	iteratorPools encoding.IteratorPools
+	iteratorOpts         iteratorOptions
+	handler              seriesLoadHandler
+	blockSize            time.Duration
+	defaultResolution    time.Duration
+	histogramBucketCount uint
 	sync.Mutex
+}
+
+func newQuerier(
+	iteratorOpts iteratorOptions,
+	handler seriesLoadHandler,
+	blockSize time.Duration,
+	defaultResolution time.Duration,
+	histogramBucketCount uint,
+) (*querier, error) {
+	if blockSize <= 0 {
+		return nil, fmt.Errorf("blockSize must be positive, got %d", blockSize)
+	}
+	if defaultResolution <= 0 {
+		return nil, fmt.Errorf("defaultResolution must be positive, got %d", defaultResolution)
+	}
+	return &querier{
+		iteratorOpts:         iteratorOpts,
+		handler:              handler,
+		blockSize:            blockSize,
+		defaultResolution:    defaultResolution,
+		histogramBucketCount: histogramBucketCount,
+	}, nil
 }
 
 func noop() error { return nil }
 
 type seriesBlock []ts.Datapoint
-type tagMap map[string]string
+
 type series struct {
 	blocks []seriesBlock
-	tags   tagMap
+	tags   parser.Tags
 }
 
-func generateSeriesBlock(
+func (q *querier) generateSeriesBlock(
 	start time.Time,
-	blockSize time.Duration,
 	resolution time.Duration,
+	integerValues bool,
 ) seriesBlock {
-	numPoints := int(blockSize / resolution)
+	numPoints := int(q.blockSize / resolution)
 	dps := make(seriesBlock, 0, numPoints)
 	for i := 0; i < numPoints; i++ {
+		stamp := start.Add(resolution * time.Duration(i))
+		var value float64
+		if integerValues {
+			value = float64(rand.Intn(1000))
+		} else {
+			value = rand.Float64()
+		}
 		dp := ts.Datapoint{
-			Timestamp: start.Add(resolution * time.Duration(i)),
-			Value:     rand.Float64(),
+			Timestamp:      stamp,
+			TimestampNanos: xtime.ToUnixNano(stamp),
+			Value:          value,
 		}
 
 		dps = append(dps, dp)
@@ -73,42 +112,28 @@ func generateSeriesBlock(
 	return dps
 }
 
-func generateSeries(
+func (q *querier) generateSeries(
 	start time.Time,
 	end time.Time,
-	blockSize time.Duration,
 	resolution time.Duration,
-	tags tagMap,
+	tags parser.Tags,
+	integerValues bool,
 ) (series, error) {
-	numBlocks := int(math.Ceil(float64(end.Sub(start)) / float64(blockSize)))
+	numBlocks := int(math.Ceil(float64(end.Sub(start)) / float64(q.blockSize)))
 	if numBlocks == 0 {
 		return series{}, fmt.Errorf("comparator querier: no blocks generated")
 	}
 
 	blocks := make([]seriesBlock, 0, numBlocks)
 	for i := 0; i < numBlocks; i++ {
-		blocks = append(blocks, generateSeriesBlock(start, blockSize, resolution))
-		start = start.Add(blockSize)
+		blocks = append(blocks, q.generateSeriesBlock(start, resolution, integerValues))
+		start = start.Add(q.blockSize)
 	}
 
 	return series{
 		blocks: blocks,
 		tags:   tags,
 	}, nil
-}
-
-func (q *querier) generateOptions(
-	start time.Time,
-	blockSize time.Duration,
-	tagOptions models.TagOptions,
-) iteratorOptions {
-	return iteratorOptions{
-		start:         start,
-		blockSize:     blockSize,
-		encoderPool:   q.encoderPool,
-		iteratorPools: q.iteratorPools,
-		tagOptions:    tagOptions,
-	}
 }
 
 type seriesGen struct {
@@ -123,35 +148,141 @@ func (q *querier) FetchCompressed(
 	options *storage.FetchOptions,
 ) (m3.SeriesFetchResult, m3.Cleanup, error) {
 	var (
-		// TODO: take from config.
-		blockSize = time.Hour * 12
-		start     = query.Start.Truncate(blockSize)
-		end       = query.End.Truncate(blockSize).Add(blockSize)
-		tagOpts   = models.NewTagOptions()
-		opts      = q.generateOptions(start, blockSize, tagOpts)
+		iters        encoding.SeriesIterators
+		randomSeries []series
+		ignoreFilter bool
+		err          error
+		nameTagFound bool
+	)
 
-		// TODO: take from config.
+	name := q.iteratorOpts.tagOptions.MetricName()
+	for _, matcher := range query.TagMatchers {
+		if bytes.Equal(name, matcher.Name) {
+			nameTagFound = true
+			iters, err = q.handler.getSeriesIterators(string(matcher.Value))
+			if err != nil {
+				return m3.SeriesFetchResult{}, noop, err
+			}
+
+			break
+		}
+	}
+
+	if iters == nil && !nameTagFound && len(query.TagMatchers) > 0 {
+		iters, err = q.handler.getSeriesIterators("")
+		if err != nil {
+			return m3.SeriesFetchResult{}, noop, err
+		}
+	}
+
+	if iters == nil || iters.Len() == 0 {
+		randomSeries, ignoreFilter, err = q.generateRandomSeries(query)
+		if err != nil {
+			return m3.SeriesFetchResult{}, noop, err
+		}
+		iters, err = buildSeriesIterators(randomSeries, query.Start, q.blockSize, q.iteratorOpts)
+		if err != nil {
+			return m3.SeriesFetchResult{}, noop, err
+		}
+	}
+
+	if !ignoreFilter {
+		filteredIters := filter(iters, query.TagMatchers)
+
+		cleanup := func() error {
+			iters.Close()
+			filteredIters.Close()
+			return nil
+		}
+
+		return m3.SeriesFetchResult{
+			SeriesIterators: filteredIters,
+			Metadata:        block.NewResultMetadata(),
+		}, cleanup, nil
+	}
+
+	cleanup := func() error {
+		iters.Close()
+		return nil
+	}
+
+	return m3.SeriesFetchResult{
+		SeriesIterators: iters,
+		Metadata:        block.NewResultMetadata(),
+	}, cleanup, nil
+}
+
+func (q *querier) generateRandomSeries(
+	query *storage.FetchQuery,
+) (series []series, ignoreFilter bool, err error) {
+	var (
+		start = query.Start.Truncate(q.blockSize)
+		end   = query.End.Truncate(q.blockSize).Add(q.blockSize)
+	)
+
+	metricNameTag := q.iteratorOpts.tagOptions.MetricName()
+	for _, matcher := range query.TagMatchers {
+		if bytes.Equal(metricNameTag, matcher.Name) {
+			if matched, _ := regexp.Match(`^multi_\d+$`, matcher.Value); matched {
+				series, err = q.generateMultiSeriesMetrics(string(matcher.Value), start, end)
+				return
+			}
+			if matched, _ := regexp.Match(`^histogram_\d+_bucket$`, matcher.Value); matched {
+				series, err = q.generateHistogramMetrics(string(matcher.Value), start, end)
+				return
+			}
+		}
+	}
+
+	ignoreFilter = true
+	series, err = q.generateSingleSeriesMetrics(query, start, end)
+	return
+}
+
+func (q *querier) generateSingleSeriesMetrics(
+	query *storage.FetchQuery,
+	start time.Time,
+	end time.Time,
+) ([]series, error) {
+	var (
 		gens = []seriesGen{
-			seriesGen{"foo", time.Second},
-			seriesGen{"bar", time.Second * 15},
-			seriesGen{"quail", time.Minute},
+			{"foo", time.Second},
+			{"bar", time.Second * 15},
+			{"quail", time.Minute},
 		}
 
 		actualGens []seriesGen
 	)
 
-	q.Lock()
-	defer q.Unlock()
-	rand.Seed(start.Unix())
+	unlock := q.lockAndSeed(start)
+	defer unlock()
+
+	metricNameTag := q.iteratorOpts.tagOptions.MetricName()
 	for _, matcher := range query.TagMatchers {
 		// filter if name, otherwise return all.
-		if bytes.Equal(opts.tagOptions.MetricName(), matcher.Name) {
+		if bytes.Equal(metricNameTag, matcher.Name) {
 			value := string(matcher.Value)
 			for _, gen := range gens {
 				if value == gen.name {
 					actualGens = append(actualGens, gen)
 					break
 				}
+			}
+
+			break
+		} else if "gen" == string(matcher.Name) {
+			cStr := string(matcher.Value)
+			count, err := strconv.Atoi(cStr)
+			if err != nil {
+				return nil, err
+			}
+
+			actualGens = make([]seriesGen, 0, count)
+			for i := 0; i < count; i++ {
+				actualGens = append(actualGens, seriesGen{
+					res:  q.defaultResolution,
+					name: fmt.Sprintf("foo_%d", i),
+				})
 			}
 
 			break
@@ -164,34 +295,115 @@ func (q *querier) FetchCompressed(
 
 	seriesList := make([]series, 0, len(actualGens))
 	for _, gen := range actualGens {
-		tagMap := map[string]string{
-			"__name__": gen.name,
-			"foobar":   "qux",
-			"name":     gen.name,
+		tags := parser.Tags{
+			parser.NewTag(model.MetricNameLabel, gen.name),
+			parser.NewTag("foobar", "qux"),
+			parser.NewTag("name", gen.name),
 		}
 
-		series, err := generateSeries(start, end, blockSize, gen.res, tagMap)
+		series, err := q.generateSeries(start, end, gen.res, tags, false)
 		if err != nil {
-			return m3.SeriesFetchResult{}, noop, err
+			return nil, err
 		}
 
 		seriesList = append(seriesList, series)
 	}
 
-	iters, err := buildSeriesIterators(seriesList, opts)
+	return seriesList, nil
+}
+
+func (q *querier) generateMultiSeriesMetrics(
+	metricsName string,
+	start time.Time,
+	end time.Time,
+) ([]series, error) {
+	suffix := strings.TrimPrefix(metricsName, "multi_")
+	seriesCount, err := strconv.Atoi(suffix)
 	if err != nil {
-		return m3.SeriesFetchResult{}, noop, err
+		return nil, err
 	}
 
-	cleanup := func() error {
-		iters.Close()
-		return nil
+	unlock := q.lockAndSeed(start)
+	defer unlock()
+
+	seriesList := make([]series, 0, seriesCount)
+	for id := 0; id < seriesCount; id++ {
+		tags := multiSeriesTags(metricsName, id)
+
+		series, err := q.generateSeries(start, end, q.defaultResolution, tags, false)
+		if err != nil {
+			return nil, err
+		}
+
+		seriesList = append(seriesList, series)
 	}
 
-	return m3.SeriesFetchResult{
-		SeriesIterators: iters,
-		Metadata:        block.NewResultMetadata(),
-	}, cleanup, nil
+	return seriesList, nil
+}
+
+func (q *querier) generateHistogramMetrics(
+	metricsName string,
+	start time.Time,
+	end time.Time,
+) ([]series, error) {
+	suffix := strings.TrimPrefix(metricsName, "histogram_")
+	countStr := strings.TrimSuffix(suffix, "_bucket")
+	seriesCount, err := strconv.Atoi(countStr)
+	if err != nil {
+		return nil, err
+	}
+
+	unlock := q.lockAndSeed(start)
+	defer unlock()
+
+	seriesList := make([]series, 0, seriesCount)
+	for id := 0; id < seriesCount; id++ {
+		le := 1.0
+		var previousSeriesBlocks []seriesBlock
+		for bucket := uint(0); bucket < q.histogramBucketCount; bucket++ {
+			tags := multiSeriesTags(metricsName, id)
+			leStr := "+Inf"
+			if bucket < q.histogramBucketCount - 1 {
+				leStr = strconv.FormatFloat(le, 'f', -1, 64)
+			}
+			leTag := parser.NewTag("le", leStr)
+			tags = append(tags, leTag)
+			le *= 10
+
+			series, err := q.generateSeries(start, end, q.defaultResolution, tags, true)
+			if err != nil {
+				return nil, err
+			}
+
+			for i, prevBlock := range previousSeriesBlocks {
+				for j, prevValue := range prevBlock {
+					series.blocks[i][j].Value += prevValue.Value
+				}
+			}
+
+			seriesList = append(seriesList, series)
+
+			previousSeriesBlocks = series.blocks
+		}
+	}
+
+	return seriesList, nil
+}
+
+func multiSeriesTags(metricsName string, id int) parser.Tags {
+	return parser.Tags{
+		parser.NewTag(model.MetricNameLabel, metricsName),
+		parser.NewTag("id", strconv.Itoa(id)),
+		parser.NewTag("parity", strconv.Itoa(id%2)),
+		parser.NewTag("const", "x"),
+	}
+}
+
+func (q *querier) lockAndSeed(start time.Time) func() {
+	q.Lock()
+	rand.Seed(start.Unix())
+
+	return q.Unlock
 }
 
 // SearchCompressed fetches matching tags based on a query.
@@ -214,7 +426,7 @@ func (q *querier) CompleteTagsCompressed(
 	return &storage.CompleteTagsResult{
 		CompleteNameOnly: nameOnly,
 		CompletedTags: []storage.CompletedTag{
-			storage.CompletedTag{
+			{
 				Name:   []byte("__name__"),
 				Values: [][]byte{[]byte("foo"), []byte("foo"), []byte("quail")},
 			},

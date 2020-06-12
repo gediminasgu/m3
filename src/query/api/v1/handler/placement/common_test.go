@@ -30,8 +30,7 @@ import (
 	"github.com/m3db/m3/src/cluster/placement"
 	"github.com/m3db/m3/src/cluster/services"
 	"github.com/m3db/m3/src/cluster/shard"
-	"github.com/m3db/m3/src/query/api/v1/handler"
-	apihandler "github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -51,30 +50,36 @@ func TestPlacementService(t *testing.T) {
 		require.NotNil(t, mockPlacementService)
 
 		mockClient.EXPECT().Services(gomock.Not(nil)).Return(mockServices, nil)
-		mockServices.EXPECT().PlacementService(gomock.Not(nil), gomock.Not(nil)).Return(mockPlacementService, nil)
+		mockServices.EXPECT().PlacementService(gomock.Not(nil), gomock.Not(nil)).
+			Return(mockPlacementService, nil)
 
-		svcDefaults := apihandler.ServiceNameAndDefaults{
+		svcDefaults := handleroptions.ServiceNameAndDefaults{
 			ServiceName: serviceName,
 		}
 
 		placementService, algo, err := ServiceWithAlgo(
-			mockClient, handler.NewServiceOptions(svcDefaults, nil, nil), time.Time{}, nil)
+			mockClient, handleroptions.
+				NewServiceOptions(svcDefaults, nil, nil), time.Time{}, nil)
 		assert.NoError(t, err)
 		assert.NotNil(t, placementService)
 		assert.NotNil(t, algo)
 
 		// Test Services returns error
-		mockClient.EXPECT().Services(gomock.Not(nil)).Return(nil, errors.New("dummy service error"))
+		mockClient.EXPECT().Services(gomock.Not(nil)).
+			Return(nil, errors.New("dummy service error"))
 		placementService, err = Service(
-			mockClient, handler.NewServiceOptions(svcDefaults, nil, nil), time.Time{}, nil)
+			mockClient, handleroptions.
+				NewServiceOptions(svcDefaults, nil, nil), time.Time{}, nil)
 		assert.Nil(t, placementService)
 		assert.EqualError(t, err, "dummy service error")
 
 		// Test PlacementService returns error
 		mockClient.EXPECT().Services(gomock.Not(nil)).Return(mockServices, nil)
-		mockServices.EXPECT().PlacementService(gomock.Not(nil), gomock.Not(nil)).Return(nil, errors.New("dummy placement error"))
+		mockServices.EXPECT().PlacementService(gomock.Not(nil), gomock.Not(nil)).
+			Return(nil, errors.New("dummy placement error"))
 		placementService, err = Service(
-			mockClient, handler.NewServiceOptions(svcDefaults, nil, nil), time.Time{}, nil)
+			mockClient, handleroptions.
+				NewServiceOptions(svcDefaults, nil, nil), time.Time{}, nil)
 		assert.Nil(t, placementService)
 		assert.EqualError(t, err, "dummy placement error")
 	})
@@ -105,14 +110,15 @@ func TestPlacementServiceWithClusterHeaders(t *testing.T) {
 			})
 
 		var (
-			serviceValue = handler.M3DBServiceName
-			svcDefaults  = apihandler.ServiceNameAndDefaults{
-				ServiceName: handler.M3DBServiceName,
+			serviceValue = handleroptions.M3DBServiceName
+			svcDefaults  = handleroptions.ServiceNameAndDefaults{
+				ServiceName: handleroptions.M3DBServiceName,
 			}
 			environmentValue = "bar_env"
 			zoneValue        = "baz_zone"
-			opts             = handler.NewServiceOptions(svcDefaults, nil, nil)
+			opts             = handleroptions.NewServiceOptions(svcDefaults, nil, nil)
 		)
+
 		opts.ServiceEnvironment = environmentValue
 		opts.ServiceZone = zoneValue
 
@@ -141,11 +147,14 @@ func TestConvertInstancesProto(t *testing.T) {
 				Endpoint:       "i1:1234",
 				Hostname:       "i1",
 				Port:           1234,
+				Metadata: &placementpb.InstanceMetadata{
+					DebugPort: 4231,
+				},
 			},
 		})
 		require.NoError(t, err)
 		require.Equal(t, 1, len(instances))
-		require.Equal(t, "Instance[ID=i1, IsolationGroup=r1, Zone=, Weight=1, Endpoint=i1:1234, Hostname=i1, Port=1234, ShardSetID=0, Shards=[Initializing=[], Available=[], Leaving=[]]]", instances[0].String())
+		require.Equal(t, "Instance[ID=i1, IsolationGroup=r1, Zone=, Weight=1, Endpoint=i1:1234, Hostname=i1, Port=1234, ShardSetID=0, Shards=[Initializing=[], Available=[], Leaving=[]], Metadata={DebugPort:4231}]", instances[0].String())
 
 		instances, err = ConvertInstancesProto([]*placementpb.Instance{
 			&placementpb.Instance{
@@ -168,6 +177,9 @@ func TestConvertInstancesProto(t *testing.T) {
 						SourceId: "s1",
 					},
 				},
+				Metadata: &placementpb.InstanceMetadata{
+					DebugPort: 1,
+				},
 			},
 			&placementpb.Instance{
 				Id:             "i2",
@@ -189,6 +201,9 @@ func TestConvertInstancesProto(t *testing.T) {
 						SourceId: "s2",
 					},
 				},
+				Metadata: &placementpb.InstanceMetadata{
+					DebugPort: 2,
+				},
 			},
 			&placementpb.Instance{
 				Id:             "i3",
@@ -207,13 +222,16 @@ func TestConvertInstancesProto(t *testing.T) {
 						CutoffNanos:  3,
 					},
 				},
+				Metadata: &placementpb.InstanceMetadata{
+					DebugPort: 3,
+				},
 			},
 		})
 		require.NoError(t, err)
 		require.Equal(t, 3, len(instances))
-		require.Equal(t, "Instance[ID=i1, IsolationGroup=r1, Zone=, Weight=1, Endpoint=i1:1234, Hostname=i1, Port=1234, ShardSetID=1, Shards=[Initializing=[], Available=[1 2], Leaving=[]]]", instances[0].String())
-		require.Equal(t, "Instance[ID=i2, IsolationGroup=r1, Zone=, Weight=1, Endpoint=i2:1234, Hostname=i2, Port=1234, ShardSetID=1, Shards=[Initializing=[], Available=[1], Leaving=[]]]", instances[1].String())
-		require.Equal(t, "Instance[ID=i3, IsolationGroup=r2, Zone=, Weight=2, Endpoint=i3:1234, Hostname=i3, Port=1234, ShardSetID=2, Shards=[Initializing=[1], Available=[], Leaving=[]]]", instances[2].String())
+		require.Equal(t, "Instance[ID=i1, IsolationGroup=r1, Zone=, Weight=1, Endpoint=i1:1234, Hostname=i1, Port=1234, ShardSetID=1, Shards=[Initializing=[], Available=[1 2], Leaving=[]], Metadata={DebugPort:1}]", instances[0].String())
+		require.Equal(t, "Instance[ID=i2, IsolationGroup=r1, Zone=, Weight=1, Endpoint=i2:1234, Hostname=i2, Port=1234, ShardSetID=1, Shards=[Initializing=[], Available=[1], Leaving=[]], Metadata={DebugPort:2}]", instances[1].String())
+		require.Equal(t, "Instance[ID=i3, IsolationGroup=r2, Zone=, Weight=2, Endpoint=i3:1234, Hostname=i3, Port=1234, ShardSetID=2, Shards=[Initializing=[1], Available=[], Leaving=[]], Metadata={DebugPort:3}]", instances[2].String())
 
 		_, err = ConvertInstancesProto([]*placementpb.Instance{
 			&placementpb.Instance{
@@ -289,21 +307,21 @@ func TestValidateAllAvailable(t *testing.T) {
 }
 
 func runForAllAllowedServices(f func(service string)) {
-	for _, service := range handler.AllowedServices() {
+	for _, service := range handleroptions.AllowedServices() {
 		f(service)
 	}
 }
 
 func TestIsStateless(t *testing.T) {
 	for _, s := range []string{
-		handler.M3CoordinatorServiceName,
+		handleroptions.M3CoordinatorServiceName,
 	} {
 		assert.True(t, isStateless(s))
 	}
 
 	for _, s := range []string{
-		handler.M3AggregatorServiceName,
-		handler.M3DBServiceName,
+		handleroptions.M3AggregatorServiceName,
+		handleroptions.M3DBServiceName,
 	} {
 		assert.False(t, isStateless(s))
 	}

@@ -21,21 +21,27 @@
 package fanout
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
 
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/errors"
+	"github.com/m3db/m3/src/query/generated/proto/prompb"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/policy/filter"
 	"github.com/m3db/m3/src/query/storage"
-	"github.com/m3db/m3/src/query/ts"
 	"github.com/m3db/m3/src/query/util/execution"
 	xerrors "github.com/m3db/m3/src/x/errors"
 	"github.com/m3db/m3/src/x/instrument"
 
 	"go.uber.org/zap"
+)
+
+const (
+	initMetricMapSize     = 10
+	fetchDataWarningError = "fetch_data_error"
 )
 
 type fanoutStorage struct {
@@ -63,24 +69,84 @@ func NewStorage(
 	}
 }
 
-func (s *fanoutStorage) Fetch(
+func (s *fanoutStorage) FetchProm(
 	ctx context.Context,
 	query *storage.FetchQuery,
 	options *storage.FetchOptions,
-) (*storage.FetchResult, error) {
+) (storage.PromResult, error) {
 	stores := filterStores(s.stores, s.fetchFilter, query)
-	requests := make([]execution.Request, 0, len(stores))
-	logger := s.instrumentOpts.Logger()
+	// Optimization for the single store case
+	if len(stores) == 1 {
+		return stores[0].FetchProm(ctx, query, options)
+	}
+
+	var (
+		mu         sync.Mutex
+		wg         sync.WaitGroup
+		multiErr   xerrors.MultiError
+		numWarning int
+		series     []*prompb.TimeSeries
+	)
+
+	wg.Add(len(stores))
+	resultMeta := block.NewResultMetadata()
 	for _, store := range stores {
-		requests = append(requests, newFetchRequest(store, query, logger, options))
+		store := store
+		go func() {
+			defer wg.Done()
+			result, err := store.FetchProm(ctx, query, options)
+			mu.Lock()
+			defer mu.Unlock()
+
+			if err != nil {
+				if warning, err := storage.IsWarning(store, err); warning {
+					resultMeta.AddWarning(store.Name(), fetchDataWarningError)
+					numWarning++
+					s.instrumentOpts.Logger().Warn(
+						"partial results: fanout to store returned warning",
+						zap.Error(err),
+						zap.String("store", store.Name()),
+						zap.String("function", "FetchProm"))
+					return
+				}
+
+				multiErr = multiErr.Add(err)
+				s.instrumentOpts.Logger().Error(
+					"fanout to store returned error",
+					zap.Error(err),
+					zap.String("store", store.Name()),
+					zap.String("function", "FetchProm"))
+				return
+			}
+
+			if series == nil {
+				series = result.PromResult.GetTimeseries()
+			} else {
+				series = append(series, result.PromResult.GetTimeseries()...)
+			}
+
+			resultMeta = resultMeta.CombineMetadata(result.Metadata)
+		}()
 	}
 
-	err := execution.ExecuteParallel(ctx, requests)
-	if err != nil {
-		return nil, err
+	wg.Wait()
+	// NB: Check multiError first; if any hard error storages errored, the entire
+	// query must be errored.
+	if err := multiErr.FinalError(); err != nil {
+		return storage.PromResult{}, err
 	}
 
-	return handleFetchResponses(requests)
+	// If there were no successful results at all, return a normal error.
+	if numWarning > 0 && numWarning == len(stores) {
+		return storage.PromResult{}, errors.ErrNoValidResults
+	}
+
+	return storage.PromResult{
+		Metadata: resultMeta,
+		PromResult: &prompb.QueryResult{
+			Timeseries: series,
+		},
+	}, nil
 }
 
 func (s *fanoutStorage) FetchBlocks(
@@ -115,7 +181,7 @@ func (s *fanoutStorage) FetchBlocks(
 
 			if err != nil {
 				if warning, err := storage.IsWarning(store, err); warning {
-					resultMeta.AddWarning(store.Name(), "fetch_blocks_warning")
+					resultMeta.AddWarning(store.Name(), fetchDataWarningError)
 					numWarning++
 					s.instrumentOpts.Logger().Warn(
 						"partial results: fanout to store returned warning",
@@ -179,7 +245,7 @@ func (s *fanoutStorage) FetchBlocks(
 	}
 
 	// If there were no successful results at all, return a normal error.
-	if numWarning == len(stores) {
+	if numWarning > 0 && numWarning == len(stores) {
 		return block.Result{}, errors.ErrNoValidResults
 	}
 
@@ -206,35 +272,6 @@ func (s *fanoutStorage) FetchBlocks(
 	}, nil
 }
 
-func handleFetchResponses(
-	requests []execution.Request,
-) (*storage.FetchResult, error) {
-	seriesList := make([]*ts.Series, 0, len(requests))
-	meta := block.NewResultMetadata()
-	for _, req := range requests {
-		fetchreq, ok := req.(*fetchRequest)
-		if !ok {
-			return nil, errors.ErrFetchRequestType
-		}
-
-		if fetchreq.result == nil {
-			return nil, errors.ErrInvalidFetchResult
-		}
-
-		// NB: even if series list is empty, result metadata must be combined for
-		// warning propagation.
-		meta = meta.CombineMetadata(fetchreq.result.Metadata)
-		seriesList = append(seriesList, fetchreq.result.SeriesList...)
-	}
-
-	return &storage.FetchResult{
-		Metadata:   meta,
-		SeriesList: seriesList,
-	}, nil
-}
-
-const initMetricMapSize = 10
-
 func (s *fanoutStorage) SearchSeries(
 	ctx context.Context,
 	query *storage.FetchQuery,
@@ -249,7 +286,7 @@ func (s *fanoutStorage) SearchSeries(
 		results, err := store.SearchSeries(ctx, query, options)
 		if err != nil {
 			if warning, err := storage.IsWarning(store, err); warning {
-				metadata.AddWarning(store.Name(), "search_series_warning")
+				metadata.AddWarning(store.Name(), fetchDataWarningError)
 				s.instrumentOpts.Logger().Warn(
 					"partial results: fanout to store returned warning",
 					zap.Error(err),
@@ -308,7 +345,7 @@ func (s *fanoutStorage) CompleteTags(
 		result, err := store.CompleteTags(ctx, query, options)
 		if err != nil {
 			if warning, err := storage.IsWarning(store, err); warning {
-				metadata.AddWarning(store.Name(), "complete_tags_warning")
+				metadata.AddWarning(store.Name(), fetchDataWarningError)
 				s.instrumentOpts.Logger().Warn(
 					"partial results: fanout to store returned warning",
 					zap.Error(err),
@@ -332,7 +369,42 @@ func (s *fanoutStorage) CompleteTags(
 
 	built := accumulatedTags.Build()
 	built.Metadata = metadata
+	built = applyOptions(built, options)
 	return &built, nil
+}
+
+func applyOptions(
+	result storage.CompleteTagsResult,
+	opts *storage.FetchOptions,
+) storage.CompleteTagsResult {
+	if opts.RestrictQueryOptions == nil {
+		return result
+	}
+
+	filter := opts.RestrictQueryOptions.GetRestrictByTag().GetFilterByNames()
+	if len(filter) > 0 {
+		// Filter out unwanted tags inplace.
+		filteredList := result.CompletedTags[:0]
+		for _, s := range result.CompletedTags {
+			skip := false
+			for _, name := range filter {
+				if bytes.Equal(s.Name, name) {
+					skip = true
+					break
+				}
+			}
+
+			if skip {
+				continue
+			}
+
+			filteredList = append(filteredList, s)
+		}
+
+		result.CompletedTags = filteredList
+	}
+
+	return result
 }
 
 func (s *fanoutStorage) Write(ctx context.Context,
@@ -412,60 +484,6 @@ func filterCompleteTagsStores(
 	}
 
 	return filtered
-}
-
-type fetchRequest struct {
-	store   storage.Storage
-	query   *storage.FetchQuery
-	options *storage.FetchOptions
-	result  *storage.FetchResult
-	logger  *zap.Logger
-}
-
-func newFetchRequest(
-	store storage.Storage,
-	query *storage.FetchQuery,
-	logger *zap.Logger,
-	options *storage.FetchOptions,
-) execution.Request {
-	return &fetchRequest{
-		store:   store,
-		query:   query,
-		options: options,
-		logger:  logger,
-	}
-}
-
-func (f *fetchRequest) Process(ctx context.Context) error {
-	result, err := f.store.Fetch(ctx, f.query, f.options)
-	if err != nil {
-		metadata := block.NewResultMetadata()
-		if warning, err := storage.IsWarning(f.store, err); warning {
-			metadata.AddWarning(f.store.Name(), "fetch_warning")
-			f.logger.Warn(
-				"partial results: fanout to store returned warning",
-				zap.Error(err),
-				zap.String("store", f.store.Name()),
-				zap.String("function", "Fetch"))
-
-			f.result = &storage.FetchResult{
-				Metadata: metadata,
-			}
-
-			return nil
-		}
-
-		f.logger.Error(
-			"fanout to store returned error",
-			zap.Error(err),
-			zap.String("store", f.store.Name()),
-			zap.String("function", "Fetch"))
-
-		return err
-	}
-
-	f.result = result
-	return nil
 }
 
 type writeRequest struct {

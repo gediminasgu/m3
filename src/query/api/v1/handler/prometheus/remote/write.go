@@ -23,6 +23,7 @@ package remote
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -35,6 +36,8 @@ import (
 	"github.com/m3db/m3/src/metrics/policy"
 	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/generated/proto/prompb"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
@@ -44,6 +47,7 @@ import (
 	xerrors "github.com/m3db/m3/src/x/errors"
 	"github.com/m3db/m3/src/x/instrument"
 	xhttp "github.com/m3db/m3/src/x/net/http"
+	"github.com/m3db/m3/src/x/retry"
 	xsync "github.com/m3db/m3/src/x/sync"
 	xtime "github.com/m3db/m3/src/x/time"
 
@@ -71,57 +75,59 @@ var (
 	errNoTagOptions                 = errors.New("no tag options set")
 	errNoNowFn                      = errors.New("no now fn set")
 	errUnaggregatedStoragePolicySet = errors.New("storage policy should not be set for unaggregated metrics")
+
+	defaultForwardingRetryForever = false
+	defaultForwardingRetryJitter  = true
+	defaultForwardRetryConfig     = retry.Configuration{
+		InitialBackoff: time.Second * 2,
+		BackoffFactor:  2,
+		MaxRetries:     1,
+		Forever:        &defaultForwardingRetryForever,
+		Jitter:         &defaultForwardingRetryJitter,
+	}
 )
 
 // PromWriteHandler represents a handler for prometheus write endpoint.
 type PromWriteHandler struct {
 	downsamplerAndWriter   ingest.DownsamplerAndWriter
 	tagOptions             models.TagOptions
-	forwarding             PromWriteHandlerForwardingOptions
+	forwarding             handleroptions.PromWriteHandlerForwardingOptions
 	forwardTimeout         time.Duration
 	forwardHTTPClient      *http.Client
 	forwardingBoundWorkers xsync.WorkerPool
 	forwardContext         context.Context
+	forwardRetrier         retry.Retrier
 	nowFn                  clock.NowFn
 	instrumentOpts         instrument.Options
 	metrics                promWriteMetrics
 }
 
-// PromWriteHandlerForwardingOptions is the forwarding options for prometheus write handler.
-type PromWriteHandlerForwardingOptions struct {
-	// MaxConcurrency is the max parallel forwarding and if zero will be unlimited.
-	MaxConcurrency int                                    `yaml:"maxConcurrency"`
-	Timeout        time.Duration                          `yaml:"timeout"`
-	Targets        []PromWriteHandlerForwardTargetOptions `yaml:"targets"`
-}
-
-// PromWriteHandlerForwardTargetOptions is a prometheus write handler forwarder target.
-type PromWriteHandlerForwardTargetOptions struct {
-	// URL of the target to send to.
-	URL string `yaml:"url"`
-	// Method defaults to POST if not set.
-	Method string `yaml:"method"`
-}
-
 // NewPromWriteHandler returns a new instance of handler.
-func NewPromWriteHandler(
-	downsamplerAndWriter ingest.DownsamplerAndWriter,
-	tagOptions models.TagOptions,
-	forwarding PromWriteHandlerForwardingOptions,
-	nowFn clock.NowFn,
-	instrumentOpts instrument.Options,
-) (http.Handler, error) {
+func NewPromWriteHandler(options options.HandlerOptions) (http.Handler, error) {
+	var (
+		downsamplerAndWriter = options.DownsamplerAndWriter()
+		tagOptions           = options.TagOptions()
+		nowFn                = options.NowFn()
+		forwarding           = options.Config().WriteForwarding.PromRemoteWrite
+		instrumentOpts       = options.InstrumentOpts()
+	)
+
 	if downsamplerAndWriter == nil {
 		return nil, errNoDownsamplerAndWriter
 	}
+
 	if tagOptions == nil {
 		return nil, errNoTagOptions
 	}
+
 	if nowFn == nil {
 		return nil, errNoNowFn
 	}
 
-	metrics, err := newPromWriteMetrics(instrumentOpts.MetricsScope())
+	scope := options.InstrumentOpts().
+		MetricsScope().
+		Tagged(map[string]string{"handler": "remote-write"})
+	metrics, err := newPromWriteMetrics(scope)
 	if err != nil {
 		return nil, err
 	}
@@ -143,6 +149,14 @@ func NewPromWriteHandler(
 	forwardHTTPOpts.DisableCompression = true // Already snappy compressed.
 	forwardHTTPOpts.RequestTimeout = forwardTimeout
 
+	forwardRetryConfig := defaultForwardRetryConfig
+	if forwarding.Retry != nil {
+		forwardRetryConfig = *forwarding.Retry
+	}
+	forwardRetryOpts := forwardRetryConfig.NewOptions(
+		scope.SubScope("forwarding-retry"),
+	)
+
 	return &PromWriteHandler{
 		downsamplerAndWriter:   downsamplerAndWriter,
 		tagOptions:             tagOptions,
@@ -151,6 +165,7 @@ func NewPromWriteHandler(
 		forwardHTTPClient:      xhttp.NewHTTPClient(forwardHTTPOpts),
 		forwardingBoundWorkers: forwardingBoundWorkers,
 		forwardContext:         context.Background(),
+		forwardRetrier:         retry.NewRetrier(forwardRetryOpts),
 		nowFn:                  nowFn,
 		metrics:                metrics,
 		instrumentOpts:         instrumentOpts,
@@ -158,15 +173,17 @@ func NewPromWriteHandler(
 }
 
 type promWriteMetrics struct {
-	writeSuccess         tally.Counter
-	writeErrorsServer    tally.Counter
-	writeErrorsClient    tally.Counter
-	ingestLatency        tally.Histogram
-	ingestLatencyBuckets tally.DurationBuckets
-	forwardSuccess       tally.Counter
-	forwardErrors        tally.Counter
-	forwardDropped       tally.Counter
-	forwardLatency       tally.Histogram
+	writeSuccess             tally.Counter
+	writeErrorsServer        tally.Counter
+	writeErrorsClient        tally.Counter
+	writeBatchLatency        tally.Histogram
+	writeBatchLatencyBuckets tally.DurationBuckets
+	ingestLatency            tally.Histogram
+	ingestLatencyBuckets     tally.DurationBuckets
+	forwardSuccess           tally.Counter
+	forwardErrors            tally.Counter
+	forwardDropped           tally.Counter
+	forwardLatency           tally.Histogram
 }
 
 func newPromWriteMetrics(scope tally.Scope) (promWriteMetrics, error) {
@@ -202,6 +219,12 @@ func newPromWriteMetrics(scope tally.Scope) (promWriteMetrics, error) {
 	}
 	upTo24hBuckets = upTo24hBuckets[1:] // Remove the first 6h to get 1 hour aligned buckets
 
+	var writeLatencyBuckets tally.DurationBuckets
+	writeLatencyBuckets = append(writeLatencyBuckets, upTo1sBuckets...)
+	writeLatencyBuckets = append(writeLatencyBuckets, upTo10sBuckets...)
+	writeLatencyBuckets = append(writeLatencyBuckets, upTo60sBuckets...)
+	writeLatencyBuckets = append(writeLatencyBuckets, upTo60mBuckets...)
+
 	var ingestLatencyBuckets tally.DurationBuckets
 	ingestLatencyBuckets = append(ingestLatencyBuckets, upTo1sBuckets...)
 	ingestLatencyBuckets = append(ingestLatencyBuckets, upTo10sBuckets...)
@@ -209,26 +232,25 @@ func newPromWriteMetrics(scope tally.Scope) (promWriteMetrics, error) {
 	ingestLatencyBuckets = append(ingestLatencyBuckets, upTo60mBuckets...)
 	ingestLatencyBuckets = append(ingestLatencyBuckets, upTo6hBuckets...)
 	ingestLatencyBuckets = append(ingestLatencyBuckets, upTo24hBuckets...)
-
-	var forwardLatencyBuckets tally.DurationBuckets
-	forwardLatencyBuckets = append(forwardLatencyBuckets, upTo1sBuckets...)
-	forwardLatencyBuckets = append(forwardLatencyBuckets, upTo10sBuckets...)
-	forwardLatencyBuckets = append(forwardLatencyBuckets, upTo60sBuckets...)
-	forwardLatencyBuckets = append(forwardLatencyBuckets, upTo60mBuckets...)
 	return promWriteMetrics{
-		writeSuccess:         scope.SubScope("write").Counter("success"),
-		writeErrorsServer:    scope.SubScope("write").Tagged(map[string]string{"code": "5XX"}).Counter("errors"),
-		writeErrorsClient:    scope.SubScope("write").Tagged(map[string]string{"code": "4XX"}).Counter("errors"),
-		ingestLatency:        scope.SubScope("ingest").Histogram("latency", ingestLatencyBuckets),
-		ingestLatencyBuckets: ingestLatencyBuckets,
-		forwardSuccess:       scope.SubScope("forward").Counter("success"),
-		forwardErrors:        scope.SubScope("forward").Counter("errors"),
-		forwardDropped:       scope.SubScope("forward").Counter("dropped"),
-		forwardLatency:       scope.SubScope("forward").Histogram("latency", forwardLatencyBuckets),
+		writeSuccess:             scope.SubScope("write").Counter("success"),
+		writeErrorsServer:        scope.SubScope("write").Tagged(map[string]string{"code": "5XX"}).Counter("errors"),
+		writeErrorsClient:        scope.SubScope("write").Tagged(map[string]string{"code": "4XX"}).Counter("errors"),
+		writeBatchLatency:        scope.SubScope("write").Histogram("batch-latency", writeLatencyBuckets),
+		writeBatchLatencyBuckets: writeLatencyBuckets,
+		ingestLatency:            scope.SubScope("ingest").Histogram("latency", ingestLatencyBuckets),
+		ingestLatencyBuckets:     ingestLatencyBuckets,
+		forwardSuccess:           scope.SubScope("forward").Counter("success"),
+		forwardErrors:            scope.SubScope("forward").Counter("errors"),
+		forwardDropped:           scope.SubScope("forward").Counter("dropped"),
+		forwardLatency:           scope.SubScope("forward").Histogram("latency", writeLatencyBuckets),
 	}, nil
 }
 
 func (h *PromWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	batchRequestStopwatch := h.metrics.writeBatchLatency.Start()
+	defer batchRequestStopwatch.Stop()
+
 	req, opts, result, rErr := h.parseRequest(r)
 	if rErr != nil {
 		h.metrics.writeErrorsClient.Inc(1)
@@ -244,17 +266,31 @@ func (h *PromWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		for _, target := range targets {
 			target := target // Capture for lambda.
 			forward := func() {
-				// Consider propgating baggage without tying
-				// context to request context in future.
-				ctx, cancel := context.WithTimeout(h.forwardContext, h.forwardTimeout)
-				defer cancel()
+				now := h.nowFn()
+				err := h.forwardRetrier.Attempt(func() error {
+					// Consider propagating baggage without tying
+					// context to request context in future.
+					ctx, cancel := context.WithTimeout(h.forwardContext, h.forwardTimeout)
+					defer cancel()
+					return h.forward(ctx, result, r.Header, target)
+				})
 
-				if err := h.forward(ctx, result, target); err != nil {
+				// Record forward ingestion delay.
+				// NB: this includes any time for retries.
+				for _, series := range req.Timeseries {
+					for _, sample := range series.Samples {
+						age := now.Sub(storage.PromTimestampToTime(sample.Timestamp))
+						h.metrics.forwardLatency.RecordDuration(age)
+					}
+				}
+
+				if err != nil {
 					h.metrics.forwardErrors.Inc(1)
 					logger := logging.WithContext(h.forwardContext, h.instrumentOpts)
 					logger.Error("forward error", zap.Error(err))
 					return
 				}
+
 				h.metrics.forwardSuccess.Inc(1)
 			}
 
@@ -340,14 +376,25 @@ func (h *PromWriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// NB(schallert): this is frustrating but if we don't explicitly write an HTTP
+	// status code (or via Write()), OpenTracing middleware reports code=0 and
+	// shows up as error.
+	w.WriteHeader(200)
 	h.metrics.writeSuccess.Inc(1)
 }
 
+// parseRequest extracts the Prometheus write request from the request body and
+// headers. WARNING: it is not guaranteed that the tags returned in the request
+// body are in sorted order. It is expected that the caller ensures the tags are
+// sorted before passing them to storage, which currently happens in write() ->
+// newTSPromIter() -> storage.PromLabelsToM3Tags() -> tags.AddTags(). This is
+// the only path written metrics are processed, but future write paths must
+// uphold the same guarantees.
 func (h *PromWriteHandler) parseRequest(
 	r *http.Request,
 ) (*prompb.WriteRequest, ingest.WriteOptions, prometheus.ParsePromCompressedRequestResult, *xhttp.ParseError) {
 	var opts ingest.WriteOptions
-	if v := strings.TrimSpace(r.Header.Get(handler.MetricsTypeHeader)); v != "" {
+	if v := strings.TrimSpace(r.Header.Get(handleroptions.MetricsTypeHeader)); v != "" {
 		// Allow the metrics type and storage policies to override
 		// the default rules and policies if specified.
 		metricsType, err := storage.ParseMetricsType(v)
@@ -363,7 +410,7 @@ func (h *PromWriteHandler) parseRequest(
 		opts.DownsampleOverride = true
 		opts.DownsampleMappingRules = nil
 
-		strPolicy := strings.TrimSpace(r.Header.Get(handler.MetricsStoragePolicyHeader))
+		strPolicy := strings.TrimSpace(r.Header.Get(handleroptions.MetricsStoragePolicyHeader))
 		switch metricsType {
 		case storage.UnaggregatedMetricsType:
 			if strPolicy != emptyStoragePolicyVar {
@@ -388,6 +435,19 @@ func (h *PromWriteHandler) parseRequest(
 			}
 		}
 	}
+	if v := strings.TrimSpace(r.Header.Get(handleroptions.WriteTypeHeader)); v != "" {
+		switch v {
+		case handleroptions.DefaultWriteType:
+		case handleroptions.AggregateWriteType:
+			opts.WriteOverride = true
+			opts.WriteStoragePolicies = policy.StoragePolicies{}
+		default:
+			err := fmt.Errorf("unrecognized write type: %s", v)
+			return nil, ingest.WriteOptions{},
+				prometheus.ParsePromCompressedRequestResult{},
+				xhttp.NewParseError(err, http.StatusBadRequest)
+		}
+	}
 
 	result, err := prometheus.ParsePromCompressedRequest(r)
 	if err != nil {
@@ -402,6 +462,19 @@ func (h *PromWriteHandler) parseRequest(
 			xhttp.NewParseError(err, http.StatusBadRequest)
 	}
 
+	if mapStr := r.Header.Get(handleroptions.MapTagsByJSONHeader); mapStr != "" {
+		var opts handleroptions.MapTagsOptions
+		if err := json.Unmarshal([]byte(mapStr), &opts); err != nil {
+			return nil, ingest.WriteOptions{}, prometheus.ParsePromCompressedRequestResult{},
+				xhttp.NewParseError(err, http.StatusBadRequest)
+		}
+
+		if err := mapTags(&req, opts); err != nil {
+			return nil, ingest.WriteOptions{}, prometheus.ParsePromCompressedRequestResult{},
+				xhttp.NewParseError(err, http.StatusBadRequest)
+		}
+	}
+
 	return &req, opts, result, nil
 }
 
@@ -410,14 +483,19 @@ func (h *PromWriteHandler) write(
 	r *prompb.WriteRequest,
 	opts ingest.WriteOptions,
 ) ingest.BatchError {
-	iter := newPromTSIter(r.Timeseries, h.tagOptions)
+	iter, err := newPromTSIter(r.Timeseries, h.tagOptions)
+	if err != nil {
+		var errs xerrors.MultiError
+		return errs.Add(err)
+	}
 	return h.downsamplerAndWriter.WriteBatch(ctx, iter, opts)
 }
 
 func (h *PromWriteHandler) forward(
 	ctx context.Context,
 	request prometheus.ParsePromCompressedRequestResult,
-	target PromWriteHandlerForwardTargetOptions,
+	headers http.Header,
+	target handleroptions.PromWriteHandlerForwardTargetOptions,
 ) error {
 	method := target.Method
 	if method == "" {
@@ -427,6 +505,25 @@ func (h *PromWriteHandler) forward(
 	req, err := http.NewRequest(method, url, bytes.NewReader(request.CompressedBody))
 	if err != nil {
 		return err
+	}
+
+	// There are multiple headers that impact coordinator behavior on the write
+	// (map tags, storage policy, etc.) that we must forward to the target
+	// coordinator to guarantee same behavior as the coordinator that originally
+	// received the request.
+	if headers != nil {
+		for h := range headers {
+			if strings.HasPrefix(h, handleroptions.M3HeaderPrefix) {
+				req.Header.Add(h, headers.Get(h))
+			}
+		}
+	}
+
+	if targetHeaders := target.Headers; targetHeaders != nil {
+		// If headers set, attach to request.
+		for name, value := range targetHeaders {
+			req.Header.Add(name, value)
+		}
 	}
 
 	resp, err := h.forwardHTTPClient.Do(req.WithContext(ctx))
@@ -444,30 +541,39 @@ func (h *PromWriteHandler) forward(
 		return fmt.Errorf("expected status code 2XX: actual=%v, method=%v, url=%v, resp=%s",
 			resp.StatusCode, method, url, response)
 	}
+
 	return nil
 }
 
-func newPromTSIter(timeseries []prompb.TimeSeries, tagOpts models.TagOptions) *promTSIter {
+func newPromTSIter(timeseries []prompb.TimeSeries, tagOpts models.TagOptions) (*promTSIter, error) {
 	// Construct the tags and datapoints upfront so that if the iterator
 	// is reset, we don't have to generate them twice.
 	var (
-		tags       = make([]models.Tags, 0, len(timeseries))
-		datapoints = make([]ts.Datapoints, 0, len(timeseries))
+		tags             = make([]models.Tags, 0, len(timeseries))
+		datapoints       = make([]ts.Datapoints, 0, len(timeseries))
+		seriesAttributes = make([]ts.SeriesAttributes, 0, len(timeseries))
 	)
 	for _, promTS := range timeseries {
+		attributes, err := storage.PromTimeSeriesToSeriesAttributes(promTS)
+		if err != nil {
+			return nil, err
+		}
+		seriesAttributes = append(seriesAttributes, attributes)
 		tags = append(tags, storage.PromLabelsToM3Tags(promTS.Labels, tagOpts))
 		datapoints = append(datapoints, storage.PromSamplesToM3Datapoints(promTS.Samples))
 	}
 
 	return &promTSIter{
+		attributes: seriesAttributes,
 		idx:        -1,
 		tags:       tags,
 		datapoints: datapoints,
-	}
+	}, nil
 }
 
 type promTSIter struct {
 	idx        int
+	attributes []ts.SeriesAttributes
 	tags       []models.Tags
 	datapoints []ts.Datapoints
 }
@@ -477,12 +583,12 @@ func (i *promTSIter) Next() bool {
 	return i.idx < len(i.tags)
 }
 
-func (i *promTSIter) Current() (models.Tags, ts.Datapoints, xtime.Unit, []byte) {
+func (i *promTSIter) Current() (models.Tags, ts.Datapoints, ts.SeriesAttributes, xtime.Unit, []byte) {
 	if len(i.tags) == 0 || i.idx < 0 || i.idx >= len(i.tags) {
-		return models.EmptyTags(), nil, 0, nil
+		return models.EmptyTags(), nil, ts.DefaultSeriesAttributes(), 0, nil
 	}
 
-	return i.tags[i.idx], i.datapoints[i.idx], xtime.Millisecond, nil
+	return i.tags[i.idx], i.datapoints[i.idx], i.attributes[i.idx], xtime.Millisecond, nil
 }
 
 func (i *promTSIter) Reset() error {

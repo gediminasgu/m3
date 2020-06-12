@@ -203,7 +203,7 @@ func NewDatabase(
 	// Wait till first namespaces value is received and set the value.
 	// Its important that this happens before the mediator is started to prevent
 	// a race condition where the namespaces haven't been initialized yet and
-	// GetOwnedNamespaces() returns an empty slice which makes the cleanup logic
+	// OwnedNamespaces() returns an empty slice which makes the cleanup logic
 	// in the background Tick think it can clean up files that it shouldn't.
 	logger.Info("resolving namespaces with namespace watch")
 	<-watch.C()
@@ -369,7 +369,7 @@ func (d *db) newDatabaseNamespaceWithLock(
 		err       error
 	)
 	if mgr := d.opts.DatabaseBlockRetrieverManager(); mgr != nil {
-		retriever, err = mgr.Retriever(md)
+		retriever, err = mgr.Retriever(md, d.shardSet)
 		if err != nil {
 			return nil, err
 		}
@@ -451,8 +451,8 @@ func (d *db) queueBootstrapWithLock() {
 		// enqueue a new bootstrap to execute before the current bootstrap
 		// completes.
 		go func() {
-			if err := d.mediator.Bootstrap(); err != nil {
-				d.log.Error("error while bootstrapping", zap.Error(err))
+			if result, err := d.mediator.Bootstrap(); err != nil && !result.AlreadyBootstrapping {
+				d.log.Error("error bootstrapping", zap.Error(err))
 			}
 		}()
 	}
@@ -537,6 +537,9 @@ func (d *db) terminateWithLock() error {
 }
 
 func (d *db) Terminate() error {
+	// NB(bodu): Wait for fs processes to finish.
+	d.mediator.WaitForFileSystemProcesses()
+
 	d.Lock()
 	defer d.Unlock()
 
@@ -544,6 +547,9 @@ func (d *db) Terminate() error {
 }
 
 func (d *db) Close() error {
+	// NB(bodu): Wait for fs processes to finish.
+	d.mediator.WaitForFileSystemProcesses()
+
 	d.Lock()
 	defer d.Unlock()
 
@@ -587,7 +593,12 @@ func (d *db) Write(
 		return nil
 	}
 
-	dp := ts.Datapoint{Timestamp: timestamp, Value: value}
+	dp := ts.Datapoint{
+		Timestamp:      timestamp,
+		TimestampNanos: xtime.ToUnixNano(timestamp),
+		Value:          value,
+	}
+
 	return d.commitLog.Write(ctx, series, dp, unit, annotation)
 }
 
@@ -616,7 +627,12 @@ func (d *db) WriteTagged(
 		return nil
 	}
 
-	dp := ts.Datapoint{Timestamp: timestamp, Value: value}
+	dp := ts.Datapoint{
+		Timestamp:      timestamp,
+		TimestampNanos: xtime.ToUnixNano(timestamp),
+		Value:          value,
+	}
+
 	return d.commitLog.Write(ctx, series, dp, unit, annotation)
 }
 
@@ -660,6 +676,15 @@ func (d *db) writeBatch(
 	errHandler IndexedErrorHandler,
 	tagged bool,
 ) error {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBWriteBatch)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.Bool("tagged", tagged),
+		)
+	}
+	defer sp.Finish()
+
 	writes, ok := writer.(ts.WriteBatch)
 	if !ok {
 		return errWriterDoesNotImplementWriteBatch
@@ -737,15 +762,16 @@ func (d *db) QueryIDs(
 	query index.Query,
 	opts index.QueryOptions,
 ) (index.QueryResult, error) {
-	ctx, sp := ctx.StartTraceSpan(tracepoint.DBQueryIDs)
-	sp.LogFields(
-		opentracinglog.String("query", query.String()),
-		opentracinglog.String("namespace", namespace.String()),
-		opentracinglog.Int("limit", opts.Limit),
-		xopentracing.Time("start", opts.StartInclusive),
-		xopentracing.Time("end", opts.EndExclusive),
-	)
-
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBQueryIDs)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("query", query.String()),
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.Int("limit", opts.Limit),
+			xopentracing.Time("start", opts.StartInclusive),
+			xopentracing.Time("end", opts.EndExclusive),
+		)
+	}
 	defer sp.Finish()
 
 	n, err := d.namespaceFor(namespace)
@@ -764,6 +790,18 @@ func (d *db) AggregateQuery(
 	query index.Query,
 	aggResultOpts index.AggregationOptions,
 ) (index.AggregateQueryResult, error) {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBAggregateQuery)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("query", query.String()),
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.Int("limit", aggResultOpts.QueryOptions.Limit),
+			xopentracing.Time("start", aggResultOpts.QueryOptions.StartInclusive),
+			xopentracing.Time("end", aggResultOpts.QueryOptions.EndExclusive),
+		)
+	}
+	defer sp.Finish()
+
 	n, err := d.namespaceFor(namespace)
 	if err != nil {
 		d.metrics.unknownNamespaceQueryIDs.Inc(1)
@@ -779,6 +817,17 @@ func (d *db) ReadEncoded(
 	id ident.ID,
 	start, end time.Time,
 ) ([][]xio.BlockReader, error) {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBReadEncoded)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.String("id", id.String()),
+			xopentracing.Time("start", start),
+			xopentracing.Time("end", end),
+		)
+	}
+	defer sp.Finish()
+
 	n, err := d.namespaceFor(namespace)
 	if err != nil {
 		d.metrics.unknownNamespaceRead.Inc(1)
@@ -795,6 +844,16 @@ func (d *db) FetchBlocks(
 	id ident.ID,
 	starts []time.Time,
 ) ([]block.FetchBlockResult, error) {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBFetchBlocks)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.Uint32("shardID", shardID),
+			opentracinglog.String("id", id.String()),
+		)
+	}
+	defer sp.Finish()
+
 	n, err := d.namespaceFor(namespace)
 	if err != nil {
 		d.metrics.unknownNamespaceFetchBlocks.Inc(1)
@@ -813,6 +872,18 @@ func (d *db) FetchBlocksMetadataV2(
 	pageToken PageToken,
 	opts block.FetchBlocksMetadataOptions,
 ) (block.FetchBlocksMetadataResults, PageToken, error) {
+	ctx, sp, sampled := ctx.StartSampledTraceSpan(tracepoint.DBFetchBlocksMetadataV2)
+	if sampled {
+		sp.LogFields(
+			opentracinglog.String("namespace", namespace.String()),
+			opentracinglog.Uint32("shardID", shardID),
+			xopentracing.Time("start", start),
+			xopentracing.Time("end", end),
+			opentracinglog.Int64("limit", limit),
+		)
+	}
+	defer sp.Finish()
+
 	n, err := d.namespaceFor(namespace)
 	if err != nil {
 		d.metrics.unknownNamespaceFetchBlocksMetadata.Inc(1)
@@ -827,7 +898,8 @@ func (d *db) Bootstrap() error {
 	d.Lock()
 	d.bootstraps++
 	d.Unlock()
-	return d.mediator.Bootstrap()
+	_, err := d.mediator.Bootstrap()
+	return err
 }
 
 func (d *db) IsBootstrapped() bool {
@@ -951,7 +1023,7 @@ func (d *db) ownedNamespacesWithLock() []databaseNamespace {
 	return namespaces
 }
 
-func (d *db) GetOwnedNamespaces() ([]databaseNamespace, error) {
+func (d *db) OwnedNamespaces() ([]databaseNamespace, error) {
 	d.RLock()
 	defer d.RUnlock()
 	if d.state == databaseClosed {
@@ -961,8 +1033,9 @@ func (d *db) GetOwnedNamespaces() ([]databaseNamespace, error) {
 }
 
 func (d *db) nextIndex() uint64 {
-	created := atomic.AddUint64(&d.created, 1)
-	return created - 1
+	// Start with index at "1" so that a default "uniqueIndex"
+	// with "0" is invalid (AddUint64 will return the new value).
+	return atomic.AddUint64(&d.created, 1)
 }
 
 type tsIDs []ident.ID

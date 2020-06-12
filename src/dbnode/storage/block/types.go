@@ -1,4 +1,4 @@
-// Copyright (c) 2016 Uber Technologies, Inc.
+// Copyright (c) 2020 Uber Technologies, Inc.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -25,6 +25,7 @@ import (
 
 	"github.com/m3db/m3/src/dbnode/encoding"
 	"github.com/m3db/m3/src/dbnode/namespace"
+	"github.com/m3db/m3/src/dbnode/sharding"
 	"github.com/m3db/m3/src/dbnode/topology"
 	"github.com/m3db/m3/src/dbnode/ts"
 	"github.com/m3db/m3/src/dbnode/x/xio"
@@ -69,9 +70,10 @@ type FilteredBlocksMetadataIter interface {
 // FetchBlockResult captures the block start time, the readers for the underlying streams, the
 // corresponding checksum and any errors encountered.
 type FetchBlockResult struct {
-	Start  time.Time
-	Blocks []xio.BlockReader
-	Err    error
+	Start      time.Time
+	FirstWrite time.Time
+	Blocks     []xio.BlockReader
+	Err        error
 }
 
 // FetchBlocksMetadataOptions are options used when fetching blocks metadata.
@@ -79,6 +81,7 @@ type FetchBlocksMetadataOptions struct {
 	IncludeSizes     bool
 	IncludeChecksums bool
 	IncludeLastRead  bool
+	OnlyDisk         bool
 }
 
 // FetchBlockMetadataResult captures the block start time, the block size, and any errors encountered
@@ -135,7 +138,6 @@ type NewDatabaseBlockFn func() DatabaseBlock
 
 // DatabaseBlock is the interface for a DatabaseBlock
 type DatabaseBlock interface {
-
 	// StartTime returns the start time of the block.
 	StartTime() time.Time
 
@@ -280,6 +282,8 @@ type DatabaseBlockRetriever interface {
 		onRetrieve OnRetrieveBlock,
 		nsCtx namespace.Context,
 	) (xio.BlockReader, error)
+
+	AssignShardSet(shardSet sharding.ShardSet)
 }
 
 // DatabaseShardBlockRetriever is a block retriever bound to a shard.
@@ -297,12 +301,17 @@ type DatabaseShardBlockRetriever interface {
 // DatabaseBlockRetrieverManager creates and holds block retrievers
 // for different namespaces.
 type DatabaseBlockRetrieverManager interface {
-	Retriever(nsMetadata namespace.Metadata) (DatabaseBlockRetriever, error)
+	// Retriever provides the DatabaseBlockRetriever for the given namespace.
+	Retriever(
+		nsMetadata namespace.Metadata,
+		shardSet sharding.ShardSet,
+	) (DatabaseBlockRetriever, error)
 }
 
 // DatabaseShardBlockRetrieverManager creates and holds shard block
 // retrievers binding shards to an existing retriever.
 type DatabaseShardBlockRetrieverManager interface {
+	// ShardRetriever provides the DatabaseShardBlockRetriever for the given shard.
 	ShardRetriever(shard uint32) DatabaseShardBlockRetriever
 }
 

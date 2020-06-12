@@ -87,13 +87,28 @@ func (c *StepLookbackConsolidator) AddPoint(dp ts.Datapoint) {
 	c.datapoints = append(c.datapoints, dp)
 }
 
+// BufferStep adds viable points to the next unconsumed buffer step.
 func (c *StepLookbackConsolidator) BufferStep() {
 	c.earliestLookback = c.earliestLookback.Add(c.stepSize)
 	val := c.fn(c.datapoints)
-	c.datapoints = removeStale(c.earliestLookback, c.datapoints)
+
+	// Remove any datapoints not relevant to the next step now.
+	datapointsRelevant := removeStale(c.earliestLookback, c.datapoints)
+	if len(datapointsRelevant) > 0 {
+		// Move them back to the start of the slice to reuse the slice
+		// as best as possible.
+		c.datapoints = c.datapoints[:len(datapointsRelevant)]
+		copy(c.datapoints, datapointsRelevant)
+	} else {
+		// No relevant datapoints, repoint to the start of the buffer.
+		c.datapoints = c.datapoints[:0]
+	}
+
+	// Blindly append to unconsumed.
 	c.unconsumed = append(c.unconsumed, val)
 }
 
+// BufferStepCount indicates how many accumulated points are still unconsumed.
 func (c *StepLookbackConsolidator) BufferStepCount() int {
 	return len(c.unconsumed)
 }
@@ -105,7 +120,18 @@ func (c *StepLookbackConsolidator) ConsolidateAndMoveToNext() float64 {
 		return c.fn(nil)
 	}
 
+	// Consume value.
 	val := c.unconsumed[0]
-	c.unconsumed = c.unconsumed[1:]
+	remaining := c.unconsumed[1:]
+
+	if len(remaining) > 0 {
+		// Move any unconsumed values to the front of unconsumed.
+		c.unconsumed = c.buffer[:len(remaining)]
+		copy(c.unconsumed, remaining)
+	} else {
+		// Otherwise just repoint to the start of the buffer.
+		c.unconsumed = c.buffer[:0]
+	}
+
 	return val
 }

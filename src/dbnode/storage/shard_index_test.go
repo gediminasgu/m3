@@ -57,7 +57,7 @@ func TestShardInsertNamespaceIndex(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	idx := NewMocknamespaceIndex(ctrl)
+	idx := NewMockNamespaceIndex(ctrl)
 	idx.EXPECT().BlockStartForWriteTime(gomock.Any()).Return(blockStart).AnyTimes()
 	idx.EXPECT().WriteBatch(gomock.Any()).Do(
 		func(batch *index.WriteBatch) {
@@ -72,7 +72,7 @@ func TestShardInsertNamespaceIndex(t *testing.T) {
 			}
 		}).Return(nil).AnyTimes()
 
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().SetWriteNewSeriesAsync(false))
 	defer shard.Close()
 
@@ -114,7 +114,7 @@ func TestShardAsyncInsertNamespaceIndex(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	idx := NewMocknamespaceIndex(ctrl)
+	idx := NewMockNamespaceIndex(ctrl)
 	idx.EXPECT().WriteBatch(gomock.Any()).Do(
 		func(batch *index.WriteBatch) {
 			lock.Lock()
@@ -122,7 +122,7 @@ func TestShardAsyncInsertNamespaceIndex(t *testing.T) {
 			lock.Unlock()
 		}).Return(nil).AnyTimes()
 
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().SetWriteNewSeriesAsync(true))
 	defer shard.Close()
 
@@ -189,7 +189,7 @@ func TestShardAsyncIndexOnlyWhenNotIndexed(t *testing.T) {
 	blockSize := time.Hour
 	now := time.Now()
 	nextWriteTime := now.Truncate(blockSize)
-	idx := NewMocknamespaceIndex(ctrl)
+	idx := NewMockNamespaceIndex(ctrl)
 	idx.EXPECT().BlockStartForWriteTime(gomock.Any()).
 		DoAndReturn(func(t time.Time) xtime.UnixNano {
 			return xtime.ToUnixNano(t.Truncate(blockSize))
@@ -209,7 +209,7 @@ func TestShardAsyncIndexOnlyWhenNotIndexed(t *testing.T) {
 			}
 		}).Return(nil)
 
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().SetWriteNewSeriesAsync(true))
 	defer shard.Close()
 
@@ -262,7 +262,7 @@ func TestShardAsyncIndexIfExpired(t *testing.T) {
 
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
-	idx := NewMocknamespaceIndex(ctrl)
+	idx := NewMockNamespaceIndex(ctrl)
 	idx.EXPECT().BlockStartForWriteTime(gomock.Any()).
 		DoAndReturn(func(t time.Time) xtime.UnixNano {
 			return xtime.ToUnixNano(t.Truncate(blockSize))
@@ -281,7 +281,7 @@ func TestShardAsyncIndexIfExpired(t *testing.T) {
 		AnyTimes()
 
 	opts := DefaultTestOptions()
-	shard := testDatabaseShardWithIndexFn(t, opts, idx)
+	shard := testDatabaseShardWithIndexFn(t, opts, idx, false)
 	shard.SetRuntimeOptions(runtime.NewOptions().SetWriteNewSeriesAsync(true))
 	defer shard.Close()
 

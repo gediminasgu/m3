@@ -32,7 +32,7 @@ import (
 	"github.com/m3db/m3/src/cluster/kv"
 	"github.com/m3db/m3/src/cluster/placement"
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
-	apihandler "github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/x/instrument"
 
 	"github.com/golang/mock/gomock"
@@ -51,6 +51,9 @@ var (
 				Endpoint:       "http://host1:1234",
 				Hostname:       "host1",
 				Port:           1234,
+				Metadata: &placementpb.InstanceMetadata{
+					DebugPort: 0,
+				},
 			},
 			"host2": &placementpb.Instance{
 				Id:             "host2",
@@ -60,6 +63,9 @@ var (
 				Endpoint:       "http://host2:1234",
 				Hostname:       "host2",
 				Port:           1234,
+				Metadata: &placementpb.InstanceMetadata{
+					DebugPort: 0,
+				},
 			},
 		},
 	}
@@ -81,10 +87,10 @@ func TestPlacementInitHandler(t *testing.T) {
 			w   = httptest.NewRecorder()
 			req *http.Request
 		)
-		if serviceName == apihandler.M3AggregatorServiceName {
-			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host1:1234","hostname": "host1","port": 1234},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234}],"num_shards": 16,"replication_factor": 1}`))
+		if serviceName == handleroptions.M3AggregatorServiceName {
+			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host1:1234","hostname": "host1","port": 1234, "metadata": {"debugPort":0}},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234, "metadata": {"debugPort":0}}],"num_shards": 16,"replication_factor": 1}`))
 		} else {
-			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host1:1234","hostname": "host1","port": 1234},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234}],"num_shards": 16,"replication_factor": 1}`))
+			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host1:1234","hostname": "host1","port": 1234, "metadata": {"debugPort":0}},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234, "metadata": {"debugPort":0}}],"num_shards": 16,"replication_factor": 1}`))
 		}
 
 		require.NotNil(t, req)
@@ -92,7 +98,7 @@ func TestPlacementInitHandler(t *testing.T) {
 		newPlacement, err := placement.NewPlacementFromProto(initTestPlacementProto)
 		require.NoError(t, err)
 
-		svcDefaults := apihandler.ServiceNameAndDefaults{
+		svcDefaults := handleroptions.ServiceNameAndDefaults{
 			ServiceName: serviceName,
 		}
 
@@ -102,19 +108,19 @@ func TestPlacementInitHandler(t *testing.T) {
 		body, err := ioutil.ReadAll(resp.Body)
 		require.NoError(t, err)
 		assert.Equal(t, http.StatusOK, resp.StatusCode)
-		assert.Equal(t, `{"placement":{"instances":{"host1":{"id":"host1","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host1:1234","shards":[],"shardSetId":0,"hostname":"host1","port":1234},"host2":{"id":"host2","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host2:1234","shards":[],"shardSetId":0,"hostname":"host2","port":1234}},"replicaFactor":0,"numShards":0,"isSharded":false,"cutoverTime":"0","isMirrored":false,"maxShardSetId":0},"version":0}`, string(body))
+		assert.Equal(t, `{"placement":{"instances":{"host1":{"id":"host1","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host1:1234","shards":[],"shardSetId":0,"hostname":"host1","port":1234,"metadata":{"debugPort":0}},"host2":{"id":"host2","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host2:1234","shards":[],"shardSetId":0,"hostname":"host2","port":1234,"metadata":{"debugPort":0}}},"replicaFactor":0,"numShards":0,"isSharded":false,"cutoverTime":"0","isMirrored":false,"maxShardSetId":0},"version":0}`, string(body))
 
 		// Test error response
 		w = httptest.NewRecorder()
-		if serviceName == apihandler.M3AggregatorServiceName {
-			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234}],"num_shards": 64,"replication_factor": 2}`))
+		if serviceName == handleroptions.M3AggregatorServiceName {
+			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234, "metadata": {"debugPort":0}},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234, "metadata": {"debugPort":0}}],"num_shards": 64,"replication_factor": 2}`))
 		} else {
-			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234}],"num_shards": 64,"replication_factor": 2}`))
+			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234, "metadata": {"debugPort":0}},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234, "metadata": {"debugPort":0}}],"num_shards": 64,"replication_factor": 2}`))
 		}
 		require.NotNil(t, req)
 
 		switch serviceName {
-		case apihandler.M3CoordinatorServiceName:
+		case handleroptions.M3CoordinatorServiceName:
 			mockPlacementService.EXPECT().
 				BuildInitialPlacement(gomock.Not(nil), 64, 1).
 				Return(nil, errors.New("unable to build initial placement"))
@@ -123,6 +129,7 @@ func TestPlacementInitHandler(t *testing.T) {
 				BuildInitialPlacement(gomock.Not(nil), 64, 2).
 				Return(nil, errors.New("unable to build initial placement"))
 		}
+
 		handler.ServeHTTP(svcDefaults, w, req)
 		resp = w.Result()
 		body, err = ioutil.ReadAll(resp.Body)
@@ -132,15 +139,15 @@ func TestPlacementInitHandler(t *testing.T) {
 
 		// Test error response
 		w = httptest.NewRecorder()
-		if serviceName == apihandler.M3AggregatorServiceName {
-			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234}],"num_shards": 64,"replication_factor": 2}`))
+		if serviceName == handleroptions.M3AggregatorServiceName {
+			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234, "metadata": {"debugPort":0}},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234, "metadata": {"debugPort":0}}],"num_shards": 64,"replication_factor": 2}`))
 		} else {
-			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234}],"num_shards": 64,"replication_factor": 2}`))
+			req = httptest.NewRequest(InitHTTPMethod, M3DBInitURL, strings.NewReader(`{"instances": [{"id": "host1","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "host1:1234","hostname": "host1","port": 1234, "metadata": {"debugPort":0}},{"id": "host2","isolation_group": "rack1","zone": "test","weight": 1,"endpoint": "http://host2:1234","hostname": "host2","port": 1234, "metadata": {"debugPort":0}}],"num_shards": 64,"replication_factor": 2}`))
 		}
-		require.NotNil(t, req)
 
+		require.NotNil(t, req)
 		switch serviceName {
-		case apihandler.M3CoordinatorServiceName:
+		case handleroptions.M3CoordinatorServiceName:
 			mockPlacementService.EXPECT().
 				BuildInitialPlacement(gomock.Not(nil), 64, 1).
 				Return(nil, kv.ErrAlreadyExists)

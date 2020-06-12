@@ -36,7 +36,7 @@ import (
 	"github.com/m3db/m3/src/cluster/placement/storage"
 	"github.com/m3db/m3/src/cluster/services"
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
-	apihandler "github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/x/instrument"
 
 	"github.com/golang/mock/gomock"
@@ -108,6 +108,9 @@ func TestPlacementGetHandler(t *testing.T) {
 					Endpoint:       "http://host1:1234",
 					Hostname:       "host1",
 					Port:           1234,
+					Metadata: &placementpb.InstanceMetadata{
+						DebugPort: 1,
+					},
 				},
 				"host2": &placementpb.Instance{
 					Id:             "host2",
@@ -117,16 +120,19 @@ func TestPlacementGetHandler(t *testing.T) {
 					Endpoint:       "http://host2:1234",
 					Hostname:       "host2",
 					Port:           1234,
+					Metadata: &placementpb.InstanceMetadata{
+						DebugPort: 2,
+					},
 				},
 			},
 		}
 
-		const placementJSON = `{"placement":{"instances":{"host1":{"id":"host1","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host1:1234","shards":[],"shardSetId":0,"hostname":"host1","port":1234},"host2":{"id":"host2","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host2:1234","shards":[],"shardSetId":0,"hostname":"host2","port":1234}},"replicaFactor":0,"numShards":0,"isSharded":false,"cutoverTime":"0","isMirrored":false,"maxShardSetId":0},"version":%d}`
+		const placementJSON = `{"placement":{"instances":{"host1":{"id":"host1","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host1:1234","shards":[],"shardSetId":0,"hostname":"host1","port":1234,"metadata":{"debugPort":1}},"host2":{"id":"host2","isolationGroup":"rack1","zone":"test","weight":1,"endpoint":"http://host2:1234","shards":[],"shardSetId":0,"hostname":"host2","port":1234,"metadata":{"debugPort":2}}},"replicaFactor":0,"numShards":0,"isSharded":false,"cutoverTime":"0","isMirrored":false,"maxShardSetId":0},"version":%d}`
 
 		placementObj, err := placement.NewPlacementFromProto(placementProto)
 		require.NoError(t, err)
 
-		svcDefaults := apihandler.ServiceNameAndDefaults{
+		svcDefaults := handleroptions.ServiceNameAndDefaults{
 			ServiceName: serviceName,
 		}
 

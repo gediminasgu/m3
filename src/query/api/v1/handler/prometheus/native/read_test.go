@@ -31,8 +31,9 @@ import (
 	"time"
 
 	"github.com/m3db/m3/src/cmd/services/m3query/config"
-	"github.com/m3db/m3/src/query/api/v1/handler"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/block"
 	"github.com/m3db/m3/src/query/executor"
 	"github.com/m3db/m3/src/query/models"
@@ -45,14 +46,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestPromReadHandler_Read(t *testing.T) {
-	testPromReadHandler_Read(t, block.NewResultMetadata(), "")
-	testPromReadHandler_Read(t, buildWarningMeta("foo", "bar"), "foo_bar")
-	testPromReadHandler_Read(t, block.ResultMetadata{Exhaustive: false},
-		handler.LimitHeaderSeriesLimitApplied)
+func TestPromReadHandlerRead(t *testing.T) {
+	testPromReadHandlerRead(t, block.NewResultMetadata(), "")
+	testPromReadHandlerRead(t, buildWarningMeta("foo", "bar"), "foo_bar")
+	testPromReadHandlerRead(t, block.ResultMetadata{Exhaustive: false},
+		handleroptions.LimitHeaderSeriesLimitApplied)
 }
 
-func testPromReadHandler_Read(
+func testPromReadHandlerRead(
 	t *testing.T,
 	resultMeta block.ResultMetadata,
 	ex string,
@@ -60,7 +61,7 @@ func testPromReadHandler_Read(
 	values, bounds := test.GenerateValuesAndBounds(nil, nil)
 
 	setup := newTestSetup()
-	promRead := setup.Handlers.Read
+	promRead := setup.Handlers.read
 
 	seriesMeta := test.NewSeriesMeta("dummy", len(values))
 	m := block.Metadata{
@@ -78,12 +79,16 @@ func testPromReadHandler_Read(
 	r, parseErr := testParseParams(req)
 	require.Nil(t, parseErr)
 	assert.Equal(t, models.FormatPromQL, r.FormatType)
-	result, err := read(context.TODO(), promRead.engine,
-		setup.QueryOpts, setup.FetchOpts, promRead.tagOpts, httptest.NewRecorder(),
-		r, instrument.NewOptions())
+	parsed := ParsedOptions{
+		QueryOpts: setup.QueryOpts,
+		FetchOpts: setup.FetchOpts,
+		Params:    r,
+	}
 
-	seriesList := result.series
+	result, err := read(context.TODO(), parsed, promRead.opts)
 	require.NoError(t, err)
+	seriesList := result.Series
+
 	require.Len(t, seriesList, 2)
 	s := seriesList[0]
 
@@ -100,14 +105,14 @@ type M3QLResp []struct {
 	StepSizeMs int               `json:"step_size_ms"`
 }
 
-func TestPromReadHandlerRead(t *testing.T) {
-	testPromReadHandlerRead(t, block.NewResultMetadata(), "")
-	testPromReadHandlerRead(t, buildWarningMeta("foo", "bar"), "foo_bar")
-	testPromReadHandlerRead(t, block.ResultMetadata{Exhaustive: false},
-		handler.LimitHeaderSeriesLimitApplied)
+func TestM3PromReadHandlerRead(t *testing.T) {
+	testM3PromReadHandlerRead(t, block.NewResultMetadata(), "")
+	testM3PromReadHandlerRead(t, buildWarningMeta("foo", "bar"), "foo_bar")
+	testM3PromReadHandlerRead(t, block.ResultMetadata{Exhaustive: false},
+		handleroptions.LimitHeaderSeriesLimitApplied)
 }
 
-func testPromReadHandlerRead(
+func testM3PromReadHandlerRead(
 	t *testing.T,
 	resultMeta block.ResultMetadata,
 	ex string,
@@ -115,7 +120,7 @@ func testPromReadHandlerRead(
 	values, bounds := test.GenerateValuesAndBounds(nil, nil)
 
 	setup := newTestSetup()
-	promRead := setup.Handlers.Read
+	promRead := setup.Handlers.read
 
 	seriesMeta := test.NewSeriesMeta("dummy", len(values))
 	meta := block.Metadata{
@@ -134,7 +139,7 @@ func testPromReadHandlerRead(
 	recorder := httptest.NewRecorder()
 	promRead.ServeHTTP(recorder, req)
 
-	header := recorder.Header().Get(handler.LimitHeader)
+	header := recorder.Header().Get(handleroptions.LimitHeader)
 	assert.Equal(t, ex, header)
 
 	var m3qlResp M3QLResp
@@ -142,12 +147,13 @@ func testPromReadHandlerRead(
 
 	assert.Len(t, m3qlResp, 2)
 	assert.Equal(t, "dummy0", m3qlResp[0].Target)
-	assert.Equal(t, map[string]string{"__name__": "dummy0", "dummy0": "dummy0"}, m3qlResp[0].Tags)
+	assert.Equal(t, map[string]string{"__name__": "dummy0", "dummy0": "dummy0"},
+		m3qlResp[0].Tags)
 	assert.Equal(t, 10000, m3qlResp[0].StepSizeMs)
 	assert.Equal(t, "dummy1", m3qlResp[1].Target)
-	assert.Equal(t, map[string]string{"__name__": "dummy1", "dummy1": "dummy1"}, m3qlResp[1].Tags)
+	assert.Equal(t, map[string]string{"__name__": "dummy1", "dummy1": "dummy1"},
+		m3qlResp[1].Tags)
 	assert.Equal(t, 10000, m3qlResp[1].StepSizeMs)
-
 }
 
 func newReadRequest(t *testing.T, params url.Values) *http.Request {
@@ -163,11 +169,12 @@ type testSetup struct {
 	QueryOpts   *executor.QueryOptions
 	FetchOpts   *storage.FetchOptions
 	TimeoutOpts *prometheus.TimeoutOpts
+	options     options.HandlerOptions
 }
 
 type testSetupHandlers struct {
-	Read        *PromReadHandler
-	InstantRead *PromReadInstantHandler
+	read        *promReadHandler
+	instantRead *promReadHandler
 }
 
 func newTestSetup() *testSetup {
@@ -180,46 +187,62 @@ func newTestSetup() *testSetup {
 		SetGlobalEnforcer(nil).
 		SetInstrumentOptions(instrumentOpts)
 	engine := executor.NewEngine(engineOpts)
-	fetchOptsBuilderCfg := handler.FetchOptionsBuilderOptions{}
-	fetchOptsBuilder := handler.NewFetchOptionsBuilder(fetchOptsBuilderCfg)
+	fetchOptsBuilderCfg := handleroptions.FetchOptionsBuilderOptions{}
+	fetchOptsBuilder := handleroptions.NewFetchOptionsBuilder(fetchOptsBuilderCfg)
 	tagOpts := models.NewTagOptions()
-	limitsConfig := &config.LimitsConfiguration{}
+	limitsConfig := config.LimitsConfiguration{}
 	keepNans := false
 
-	read := NewPromReadHandler(engine, fetchOptsBuilder, tagOpts,
-		limitsConfig, timeoutOpts, keepNans, instrumentOpts)
+	opts := options.EmptyHandlerOptions().
+		SetEngine(engine).
+		SetFetchOptionsBuilder(fetchOptsBuilder).
+		SetTagOptions(tagOpts).
+		SetTimeoutOpts(timeoutOpts).
+		SetInstrumentOpts(instrumentOpts).
+		SetConfig(config.Configuration{
+			Limits: limitsConfig,
+			ResultOptions: config.ResultOptions{
+				KeepNans: keepNans,
+			},
+		})
 
-	instantRead := NewPromReadInstantHandler(engine, fetchOptsBuilder,
-		tagOpts, timeoutOpts, instrumentOpts)
+	read := NewPromReadHandler(opts).(*promReadHandler)
+	instantRead := NewPromReadInstantHandler(opts).(*promReadHandler)
 
 	return &testSetup{
 		Storage: mockStorage,
 		Handlers: testSetupHandlers{
-			Read:        read,
-			InstantRead: instantRead,
+			read:        read,
+			instantRead: instantRead,
 		},
 		QueryOpts:   &executor.QueryOptions{},
 		FetchOpts:   storage.NewFetchOptions(),
 		TimeoutOpts: timeoutOpts,
+		options:     opts,
 	}
 }
 
-func TestPromReadHandler_ServeHTTP_maxComputedDatapoints(t *testing.T) {
+func TestPromReadHandlerServeHTTPMaxComputedDatapoints(t *testing.T) {
 	setup := newTestSetup()
-	setup.Handlers.Read.limitsCfg = &config.LimitsConfiguration{
-		PerQuery: config.PerQueryLimitsConfiguration{
-			PrivateMaxComputedDatapoints: 3599,
+	opts := setup.Handlers.read.opts
+	setup.Handlers.read.opts = opts.SetConfig(config.Configuration{
+		Limits: config.LimitsConfiguration{
+			PerQuery: config.PerQueryLimitsConfiguration{
+				PrivateMaxComputedDatapoints: 3599,
+			},
 		},
-	}
+	})
 
 	params := defaultParams()
-	params.Set(startParam, time.Date(2018, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano))
-	params.Set(endParam, time.Date(2018, 1, 1, 1, 0, 0, 0, time.UTC).Format(time.RFC3339Nano))
-	params.Set(handler.StepParam, (time.Second).String())
+	params.Set(startParam, time.Date(2018, 1, 1, 0, 0, 0, 0, time.UTC).
+		Format(time.RFC3339Nano))
+	params.Set(endParam, time.Date(2018, 1, 1, 1, 0, 0, 0, time.UTC).
+		Format(time.RFC3339Nano))
+	params.Set(handleroptions.StepParam, (time.Second).String())
 	req := newReadRequest(t, params)
 
 	recorder := httptest.NewRecorder()
-	setup.Handlers.Read.ServeHTTP(recorder, req)
+	setup.Handlers.read.ServeHTTP(recorder, req)
 	resp := recorder.Result()
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
@@ -245,87 +268,79 @@ func TestPromReadHandler_validateRequest(t *testing.T) {
 	}
 
 	cases := []struct {
-		Name          string
-		Params        *models.RequestParams
-		Max           int64
-		ErrorExpected bool
+		name          string
+		params        models.RequestParams
+		max           int
+		errorExpected bool
 	}{{
-		Name: "under limit",
-		Params: &models.RequestParams{
+		name: "under limit",
+		params: models.RequestParams{
 			Step:  time.Second,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 1),
 		},
-		Max:           3601,
-		ErrorExpected: false,
+		max:           3601,
+		errorExpected: false,
 	}, {
-		Name: "at limit",
-		Params: &models.RequestParams{
+		name: "at limit",
+		params: models.RequestParams{
 			Step:  time.Second,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 1),
 		},
-		Max:           3600,
-		ErrorExpected: false,
+		max:           3600,
+		errorExpected: false,
 	}, {
-		Name: "over limit",
-		Params: &models.RequestParams{
+		name: "over limit",
+		params: models.RequestParams{
 			Step:  time.Second,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 1),
 		},
-		Max:           3599,
-		ErrorExpected: true,
+		max:           3599,
+		errorExpected: true,
 	}, {
-		Name: "large query, limit disabled (0)",
-		Params: &models.RequestParams{
+		name: "large query, limit disabled (0)",
+		params: models.RequestParams{
 			Step:  time.Second,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 1),
 		},
-		Max:           0,
-		ErrorExpected: false,
+		max:           0,
+		errorExpected: false,
 	}, {
-		Name: "large query, limit disabled (negative)",
-		Params: &models.RequestParams{
+		name: "large query, limit disabled (negative)",
+		params: models.RequestParams{
 			Step:  time.Second,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 1),
 		},
-		Max:           -50,
-		ErrorExpected: false,
+		max:           -50,
+		errorExpected: false,
 	}, {
-		Name: "uneven step over limit",
-		Params: &models.RequestParams{
+		name: "uneven step over limit",
+		params: models.RequestParams{
 			Step:  34 * time.Minute,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 11),
 		},
-		Max:           1,
-		ErrorExpected: true,
+		max:           1,
+		errorExpected: true,
 	}, {
-		Name: "uneven step under limit",
-		Params: &models.RequestParams{
+		name: "uneven step under limit",
+		params: models.RequestParams{
 			Step:  34 * time.Minute,
 			Start: dt(2018, 1, 1, 0),
 			End:   dt(2018, 1, 1, 1),
 		},
-		Max:           2,
-		ErrorExpected: false},
+		max:           2,
+		errorExpected: false},
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.Name, func(t *testing.T) {
-			setup := newTestSetup()
-			setup.Handlers.Read.limitsCfg = &config.LimitsConfiguration{
-				PerQuery: config.PerQueryLimitsConfiguration{
-					PrivateMaxComputedDatapoints: tc.Max,
-				},
-			}
-
-			err := setup.Handlers.Read.validateRequest(tc.Params)
-
-			if tc.ErrorExpected {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateRequest(tc.params, tc.max)
+			if tc.errorExpected {
 				require.Error(t, err)
 			} else {
 				require.NoError(t, err)

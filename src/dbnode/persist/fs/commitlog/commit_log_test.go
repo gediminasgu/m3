@@ -46,22 +46,6 @@ import (
 	"github.com/uber-go/tally"
 )
 
-// readAllSeriesPredicateTest is the same as ReadAllSeriesPredicate except
-// it asserts that the ID and the namespace are not nil.
-func readAllSeriesPredicateTest() SeriesFilterPredicate {
-	return func(id ident.ID, namespace ident.ID) bool {
-		if id == nil {
-			panic(fmt.Sprintf("series ID passed to series predicate is nil"))
-		}
-
-		if namespace == nil {
-			panic(fmt.Sprintf("namespace ID passed to series predicate is nil"))
-		}
-
-		return true
-	}
-}
-
 type mockTime struct {
 	sync.Mutex
 	t time.Time
@@ -127,6 +111,12 @@ func newTestOptions(
 	opts = opts.SetStrategy(overrides.strategy)
 
 	return opts, scope
+}
+
+func randomByteSlice(len int) []byte {
+	arr := make([]byte, len)
+	rand.Read(arr)
+	return arr
 }
 
 func cleanup(t *testing.T, opts Options) {
@@ -317,9 +307,8 @@ type seriesTestWritesAndReadPosition struct {
 
 func assertCommitLogWritesByIterating(t *testing.T, l *commitLog, writes []testWrite) {
 	iterOpts := IteratorOpts{
-		CommitLogOptions:      l.opts,
-		FileFilterPredicate:   ReadAllPredicate(),
-		SeriesFilterPredicate: readAllSeriesPredicateTest(),
+		CommitLogOptions:    l.opts,
+		FileFilterPredicate: ReadAllPredicate(),
 	}
 	iter, corruptFiles, err := NewIterator(iterOpts)
 	require.NoError(t, err)
@@ -340,15 +329,16 @@ func assertCommitLogWritesByIterating(t *testing.T, l *commitLog, writes []testW
 	}
 
 	for iter.Next() {
-		series, datapoint, unit, annotation := iter.Current()
+		entry := iter.Current()
 
-		seriesWrites := writesBySeries[series.ID.String()]
+		id := entry.Series.ID.String()
+		seriesWrites := writesBySeries[id]
 		write := seriesWrites.writes[seriesWrites.readPosition]
 
-		write.assert(t, series, datapoint, unit, annotation)
+		write.assert(t, entry.Series, entry.Datapoint, entry.Unit, entry.Annotation)
 
 		seriesWrites.readPosition++
-		writesBySeries[series.ID.String()] = seriesWrites
+		writesBySeries[id] = seriesWrites
 	}
 
 	require.NoError(t, iter.Err())
@@ -370,23 +360,75 @@ func TestCommitLogWrite(t *testing.T) {
 	opts, scope := newTestOptions(t, overrides{
 		strategy: StrategyWriteWait,
 	})
-	defer cleanup(t, opts)
 
-	commitLog := newTestCommitLog(t, opts)
-
-	writes := []testWrite{
-		{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, []byte{1, 2, 3}, nil},
-		{testSeries(1, "foo.baz", ident.NewTags(ident.StringTag("name2", "val2")), 150), time.Now(), 456.789, xtime.Second, nil, nil},
+	testCases := []struct {
+		testName string
+		writes   []testWrite
+	}{
+		{
+			"Attempt to perform 2 write log writes in parallel to a commit log",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, []byte{1, 2, 3}, nil},
+				{testSeries(1, "foo.baz", ident.NewTags(ident.StringTag("name2", "val2")), 150), time.Now(), 456.789, xtime.Second, nil, nil},
+			},
+		},
+		{
+			"Buffer almost full after first write. Second write almost fills the buffer",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, randomByteSlice(opts.FlushSize() - 200), nil},
+				{testSeries(1, "foo.baz", ident.NewTags(ident.StringTag("name2", "val2")), 150), time.Now(), 456.789, xtime.Second, randomByteSlice(40), nil},
+			},
+		},
+		{
+			"Buffer almost full after first write. Second write almost fills 2*buffer total",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, randomByteSlice(opts.FlushSize() - 200), nil},
+				{testSeries(1, "foo.baz", ident.NewTags(ident.StringTag("name2", "val2")), 150), time.Now(), 456.789, xtime.Second, randomByteSlice(40 + opts.FlushSize()), nil},
+			},
+		},
+		{
+			"Buffer almost full after first write. Second write almost fills 3*buffer total",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, randomByteSlice(opts.FlushSize() - 200), nil},
+				{testSeries(1, "foo.baz", ident.NewTags(ident.StringTag("name2", "val2")), 150), time.Now(), 456.789, xtime.Second, randomByteSlice(40 + 2*opts.FlushSize()), nil},
+			},
+		},
+		{
+			"Attempts to perform a write equal to the flush size",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, randomByteSlice(opts.FlushSize()), nil},
+			},
+		},
+		{
+			"Attempts to perform a write double the flush size",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, randomByteSlice(2 * opts.FlushSize()), nil},
+			},
+		},
+		{
+			"Attempts to perform a write three times the flush size",
+			[]testWrite{
+				{testSeries(0, "foo.bar", ident.NewTags(ident.StringTag("name1", "val1")), 127), time.Now(), 123.456, xtime.Second, randomByteSlice(3 * opts.FlushSize()), nil},
+			},
+		},
 	}
 
-	// Call write sync
-	writeCommitLogs(t, scope, commitLog, writes).Wait()
+	for _, testCase := range testCases {
+		t.Run(testCase.testName, func(t *testing.T) {
+			defer cleanup(t, opts)
 
-	// Close the commit log and consequently flush
-	require.NoError(t, commitLog.Close())
+			commitLog := newTestCommitLog(t, opts)
 
-	// Assert writes occurred by reading the commit log
-	assertCommitLogWritesByIterating(t, commitLog, writes)
+			// Call write sync
+			writeCommitLogs(t, scope, commitLog, testCase.writes).Wait()
+
+			// Close the commit log and consequently flush
+			require.NoError(t, commitLog.Close())
+
+			// Assert writes occurred by reading the commit log
+			assertCommitLogWritesByIterating(t, commitLog, testCase.writes)
+		})
+	}
 }
 
 func TestReadCommitLogMissingMetadata(t *testing.T) {
@@ -444,9 +486,8 @@ func TestReadCommitLogMissingMetadata(t *testing.T) {
 
 	// Make sure we don't panic / deadlock
 	iterOpts := IteratorOpts{
-		CommitLogOptions:      opts,
-		FileFilterPredicate:   ReadAllPredicate(),
-		SeriesFilterPredicate: readAllSeriesPredicateTest(),
+		CommitLogOptions:    opts,
+		FileFilterPredicate: ReadAllPredicate(),
 	}
 	iter, corruptFiles, err := NewIterator(iterOpts)
 	require.NoError(t, err)
@@ -494,7 +535,7 @@ func TestCommitLogReaderIsNotReusable(t *testing.T) {
 	require.Equal(t, 2, len(files))
 
 	// Assert commitlog cannot be opened more than once
-	reader := newCommitLogReader(opts, readAllSeriesPredicateTest())
+	reader := newCommitLogReader(commitLogReaderOptions{commitLogOptions: opts})
 	_, err = reader.Open(files[0])
 	require.NoError(t, err)
 	reader.Close()
@@ -550,9 +591,8 @@ func TestCommitLogIteratorUsesPredicateFilterForNonCorruptFiles(t *testing.T) {
 	// Assert that the commitlog iterator honors the predicate and only uses
 	// 2 of the 3 files.
 	iterOpts := IteratorOpts{
-		CommitLogOptions:      opts,
-		FileFilterPredicate:   commitLogPredicate,
-		SeriesFilterPredicate: readAllSeriesPredicateTest(),
+		CommitLogOptions:    opts,
+		FileFilterPredicate: commitLogPredicate,
 	}
 	iter, corruptFiles, err := NewIterator(iterOpts)
 	require.NoError(t, err)
@@ -595,9 +635,8 @@ func TestCommitLogIteratorUsesPredicateFilterForCorruptFiles(t *testing.T) {
 
 	// Assert that the corrupt file is returned from the iterator.
 	iterOpts := IteratorOpts{
-		CommitLogOptions:      opts,
-		FileFilterPredicate:   ReadAllPredicate(),
-		SeriesFilterPredicate: readAllSeriesPredicateTest(),
+		CommitLogOptions:    opts,
+		FileFilterPredicate: ReadAllPredicate(),
 	}
 	iter, corruptFiles, err := NewIterator(iterOpts)
 	require.NoError(t, err)
@@ -612,9 +651,8 @@ func TestCommitLogIteratorUsesPredicateFilterForCorruptFiles(t *testing.T) {
 	}
 
 	iterOpts = IteratorOpts{
-		CommitLogOptions:      opts,
-		FileFilterPredicate:   ignoreCorruptPredicate,
-		SeriesFilterPredicate: readAllSeriesPredicateTest(),
+		CommitLogOptions:    opts,
+		FileFilterPredicate: ignoreCorruptPredicate,
 	}
 	iter, corruptFiles, err = NewIterator(iterOpts)
 	require.NoError(t, err)

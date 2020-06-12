@@ -36,7 +36,7 @@ import (
 	"github.com/m3db/m3/src/x/instrument"
 	xtime "github.com/m3db/m3/src/x/time"
 
-	"github.com/cespare/xxhash"
+	"github.com/cespare/xxhash/v2"
 	"github.com/jhump/protoreflect/desc"
 )
 
@@ -67,6 +67,7 @@ type Encoder struct {
 	lastEncodedDP   ts.Datapoint
 	customFields    []customFieldState
 	nonCustomFields []marshalledField
+	prevAnnotation  ts.Annotation
 
 	// Fields that are reused between function calls to
 	// avoid allocations.
@@ -168,6 +169,7 @@ func (enc *Encoder) Encode(dp ts.Datapoint, timeUnit xtime.Unit, protoBytes ts.A
 
 	enc.numEncoded++
 	enc.lastEncodedDP = dp
+	enc.prevAnnotation = protoBytes
 	enc.stats.IncUncompressedBytes(len(protoBytes))
 	return nil
 }
@@ -259,7 +261,7 @@ func (enc *Encoder) segmentZeroCopy(ctx context.Context) ts.Segment {
 	tail := tails[lastByte]
 
 	// Only discard the head since tails are shared for process life time.
-	return ts.NewSegment(head, tail, ts.FinalizeHead)
+	return ts.NewSegment(head, tail, 0, ts.FinalizeHead)
 }
 
 func (enc *Encoder) segmentTakeOwnership() ts.Segment {
@@ -271,7 +273,7 @@ func (enc *Encoder) segmentTakeOwnership() ts.Segment {
 	// Take ref from the ostream.
 	head := enc.stream.Discard()
 
-	return ts.NewSegment(head, nil, ts.FinalizeHead)
+	return ts.NewSegment(head, nil, 0, ts.FinalizeHead)
 }
 
 // NumEncoded returns the number of encoded messages.
@@ -294,6 +296,16 @@ func (enc *Encoder) LastEncoded() (ts.Datapoint, error) {
 	// but set it again to be safe.
 	enc.lastEncodedDP.Value = 0
 	return enc.lastEncodedDP, nil
+}
+
+// LastAnnotation returns the last encoded annotation (which contain the bytes
+// used for ProtoBuf data).
+func (enc *Encoder) LastAnnotation() (ts.Annotation, error) {
+	if enc.numEncoded == 0 {
+		return nil, errNoEncodedDatapoints
+	}
+
+	return enc.prevAnnotation, nil
 }
 
 // Len returns the length of the data stream.
@@ -467,6 +479,7 @@ func (enc *Encoder) Reset(
 	enc.reset(start, capacity)
 }
 
+// SetSchema sets the schema for the encoder.
 func (enc *Encoder) SetSchema(descr namespace.SchemaDescr) {
 	if descr == nil {
 		enc.schemaDesc = nil

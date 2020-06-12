@@ -40,7 +40,8 @@ type results struct {
 	nsID ident.ID
 	opts QueryResultsOptions
 
-	resultsMap *ResultsMap
+	resultsMap     *ResultsMap
+	totalDocsCount int
 
 	idPool    ident.Pool
 	bytesPool pool.CheckedBytesPool
@@ -88,6 +89,7 @@ func (r *results) Reset(nsID ident.ID, opts QueryResultsOptions) {
 
 	// Reset all keys in the map next, this will finalize the keys.
 	r.resultsMap.Reset()
+	r.totalDocsCount = 0
 
 	// NB: could do keys+value in one step but I'm trying to avoid
 	// using an internal method of a code-gen'd type.
@@ -101,6 +103,7 @@ func (r *results) AddDocuments(batch []doc.Document) (int, error) {
 	r.Lock()
 	err := r.addDocumentsBatchWithLock(batch)
 	size := r.resultsMap.Len()
+	r.totalDocsCount += len(batch)
 	r.Unlock()
 	return size, err
 }
@@ -119,9 +122,7 @@ func (r *results) addDocumentsBatchWithLock(batch []doc.Document) error {
 	return nil
 }
 
-func (r *results) addDocumentWithLock(
-	d doc.Document,
-) (bool, int, error) {
+func (r *results) addDocumentWithLock(d doc.Document) (bool, int, error) {
 	if len(d.ID) == 0 {
 		return false, r.resultsMap.Len(), errUnableToAddResultMissingID
 	}
@@ -141,7 +142,7 @@ func (r *results) addDocumentWithLock(
 	}
 
 	// i.e. it doesn't exist in the map, so we create the tags wrapping
-	// fields prodided by the document.
+	// fields provided by the document.
 	tags := convert.ToMetricTags(d, convert.Opts{NoClone: true})
 
 	// It is assumed that the document is valid for the lifetime of the index
@@ -173,6 +174,13 @@ func (r *results) Size() int {
 	v := r.resultsMap.Len()
 	r.RUnlock()
 	return v
+}
+
+func (r *results) TotalDocsCount() int {
+	r.RLock()
+	count := r.totalDocsCount
+	r.RUnlock()
+	return count
 }
 
 func (r *results) Finalize() {

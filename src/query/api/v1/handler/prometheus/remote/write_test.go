@@ -32,9 +32,11 @@ import (
 	"time"
 
 	"github.com/m3db/m3/src/cmd/services/m3coordinator/ingest"
+	"github.com/m3db/m3/src/cmd/services/m3query/config"
 	"github.com/m3db/m3/src/metrics/policy"
-	"github.com/m3db/m3/src/query/api/v1/handler"
+	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/handleroptions"
 	"github.com/m3db/m3/src/query/api/v1/handler/prometheus/remote/test"
+	"github.com/m3db/m3/src/query/api/v1/options"
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/storage"
 	xclock "github.com/m3db/m3/src/x/clock"
@@ -46,14 +48,25 @@ import (
 	"github.com/uber-go/tally"
 )
 
+func makeOptions(ds ingest.DownsamplerAndWriter) options.HandlerOptions {
+	return options.EmptyHandlerOptions().
+		SetNowFn(time.Now).
+		SetDownsamplerAndWriter(ds).
+		SetTagOptions(models.NewTagOptions()).
+		SetConfig(config.Configuration{
+			WriteForwarding: config.WriteForwardingConfiguration{
+				PromRemoteWrite: handleroptions.PromWriteHandlerForwardingOptions{},
+			},
+		})
+}
+
 func TestPromWriteParsing(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	mockDownsamplerAndWriter := ingest.NewMockDownsamplerAndWriter(ctrl)
-	handler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, instrument.NewOptions())
+	handlerOpts := makeOptions(mockDownsamplerAndWriter)
+	handler, err := NewPromWriteHandler(handlerOpts)
 	require.NoError(t, err)
 
 	promReq := test.GeneratePromWriteRequest()
@@ -75,9 +88,8 @@ func TestPromWrite(t *testing.T) {
 		EXPECT().
 		WriteBatch(gomock.Any(), gomock.Any(), gomock.Any())
 
-	handler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, instrument.NewOptions())
+	opts := makeOptions(mockDownsamplerAndWriter)
+	handler, err := NewPromWriteHandler(opts)
 	require.NoError(t, err)
 
 	promReq := test.GeneratePromWriteRequest()
@@ -102,9 +114,8 @@ func TestPromWriteError(t *testing.T) {
 		WriteBatch(gomock.Any(), gomock.Any(), gomock.Any()).
 		Return(batchErr)
 
-	handler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, instrument.NewOptions())
+	opts := makeOptions(mockDownsamplerAndWriter)
+	handler, err := NewPromWriteHandler(opts)
 	require.NoError(t, err)
 
 	promReq := test.GeneratePromWriteRequest()
@@ -131,19 +142,16 @@ func TestWriteErrorMetricCount(t *testing.T) {
 	scope := tally.NewTestScope("",
 		map[string]string{"test": "error-metric-test"})
 
-	iopts := instrument.NewOptions().
-		SetMetricsScope(scope)
-
-	handler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, iopts)
+	iopts := instrument.NewOptions().SetMetricsScope(scope)
+	opts := makeOptions(mockDownsamplerAndWriter).SetInstrumentOpts(iopts)
+	handler, err := NewPromWriteHandler(opts)
 	require.NoError(t, err)
 
 	req := httptest.NewRequest(PromWriteHTTPMethod, PromWriteURL, nil)
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
 	foundMetric := xclock.WaitUntil(func() bool {
-		found, ok := scope.Snapshot().Counters()["write.errors+code=4XX,test=error-metric-test"]
+		found, ok := scope.Snapshot().Counters()["write.errors+code=4XX,handler=remote-write,test=error-metric-test"]
 		return ok && found.Value() == 1
 	}, 5*time.Second)
 	require.True(t, foundMetric)
@@ -161,9 +169,9 @@ func TestWriteDatapointDelayMetric(t *testing.T) {
 	scope := tally.NewTestScope("",
 		map[string]string{"test": "delay-metric-test"})
 
-	handler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, instrument.NewOptions().SetMetricsScope(scope))
+	iopts := instrument.NewOptions().SetMetricsScope(scope)
+	opts := makeOptions(mockDownsamplerAndWriter).SetInstrumentOpts(iopts)
+	handler, err := NewPromWriteHandler(opts)
 	require.NoError(t, err)
 
 	writeHandler, ok := handler.(*PromWriteHandler)
@@ -193,7 +201,7 @@ func TestWriteDatapointDelayMetric(t *testing.T) {
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
 	foundMetric := xclock.WaitUntil(func() bool {
-		values, found := scope.Snapshot().Histograms()["ingest.latency+test=delay-metric-test"]
+		values, found := scope.Snapshot().Histograms()["ingest.latency+handler=remote-write,test=delay-metric-test"]
 		if !found {
 			return false
 		}
@@ -223,19 +231,18 @@ func TestPromWriteUnaggregatedMetricsWithHeader(t *testing.T) {
 		EXPECT().
 		WriteBatch(gomock.Any(), gomock.Any(), expectedIngestWriteOptions)
 
-	writeHandler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, instrument.NewOptions())
+	opts := makeOptions(mockDownsamplerAndWriter)
+	handler, err := NewPromWriteHandler(opts)
 	require.NoError(t, err)
 
 	promReq := test.GeneratePromWriteRequest()
 	promReqBody := test.GeneratePromWriteRequestBody(t, promReq)
 	req := httptest.NewRequest(PromWriteHTTPMethod, PromWriteURL, promReqBody)
-	req.Header.Add(handler.MetricsTypeHeader,
+	req.Header.Add(handleroptions.MetricsTypeHeader,
 		storage.UnaggregatedMetricsType.String())
 
 	writer := httptest.NewRecorder()
-	writeHandler.ServeHTTP(writer, req)
+	handler.ServeHTTP(writer, req)
 	resp := writer.Result()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 }
@@ -258,21 +265,45 @@ func TestPromWriteAggregatedMetricsWithHeader(t *testing.T) {
 		EXPECT().
 		WriteBatch(gomock.Any(), gomock.Any(), expectedIngestWriteOptions)
 
-	writeHandler, err := NewPromWriteHandler(mockDownsamplerAndWriter,
-		models.NewTagOptions(), PromWriteHandlerForwardingOptions{},
-		time.Now, instrument.NewOptions())
+	opts := makeOptions(mockDownsamplerAndWriter)
+	writeHandler, err := NewPromWriteHandler(opts)
 	require.NoError(t, err)
 
 	promReq := test.GeneratePromWriteRequest()
 	promReqBody := test.GeneratePromWriteRequestBody(t, promReq)
 	req := httptest.NewRequest(PromWriteHTTPMethod, PromWriteURL, promReqBody)
-	req.Header.Add(handler.MetricsTypeHeader,
+	req.Header.Add(handleroptions.MetricsTypeHeader,
 		storage.AggregatedMetricsType.String())
-	req.Header.Add(handler.MetricsStoragePolicyHeader,
+	req.Header.Add(handleroptions.MetricsStoragePolicyHeader,
 		"1m:21d")
 
 	writer := httptest.NewRecorder()
 	writeHandler.ServeHTTP(writer, req)
 	resp := writer.Result()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func BenchmarkWriteDatapoints(b *testing.B) {
+	ctrl := gomock.NewController(b)
+	defer ctrl.Finish()
+
+	mockDownsamplerAndWriter := ingest.NewMockDownsamplerAndWriter(ctrl)
+	mockDownsamplerAndWriter.
+		EXPECT().
+		WriteBatch(gomock.Any(), gomock.Any(), gomock.Any()).
+		AnyTimes()
+
+	opts := makeOptions(mockDownsamplerAndWriter)
+	handler, err := NewPromWriteHandler(opts)
+	require.NoError(b, err)
+
+	promReq := test.GeneratePromWriteRequest()
+	promReqBody := test.GeneratePromWriteRequestBodyBytes(b, promReq)
+	promReqBodyReader := bytes.NewReader(nil)
+
+	for i := 0; i < b.N; i++ {
+		promReqBodyReader.Reset(promReqBody)
+		req := httptest.NewRequest(PromWriteHTTPMethod, PromWriteURL, promReqBodyReader)
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+	}
 }

@@ -31,13 +31,14 @@ import (
 	"github.com/m3db/m3/src/query/models"
 	"github.com/m3db/m3/src/query/parser"
 
-	pql "github.com/prometheus/prometheus/promql"
+	pql "github.com/prometheus/prometheus/promql/parser"
 )
 
 type promParser struct {
-	stepSize time.Duration
-	expr     pql.Expr
-	tagOpts  models.TagOptions
+	stepSize          time.Duration
+	expr              pql.Expr
+	tagOpts           models.TagOptions
+	parseFunctionExpr ParseFunctionExpr
 }
 
 // Parse takes a promQL string and converts parses it into a DAG.
@@ -45,24 +46,29 @@ func Parse(
 	q string,
 	stepSize time.Duration,
 	tagOpts models.TagOptions,
+	parseOptions ParseOptions,
 ) (parser.Parser, error) {
-	expr, err := pql.ParseExpr(q)
+	fn := parseOptions.ParseFn()
+	expr, err := fn(q)
 	if err != nil {
 		return nil, err
 	}
 
 	return &promParser{
-		expr:     expr,
-		stepSize: stepSize,
-		tagOpts:  tagOpts,
+		expr:              expr,
+		stepSize:          stepSize,
+		tagOpts:           tagOpts,
+		parseFunctionExpr: parseOptions.FunctionParseExpr(),
 	}, nil
 }
 
 func (p *promParser) DAG() (parser.Nodes, parser.Edges, error) {
 	state := &parseState{
-		stepSize: p.stepSize,
-		tagOpts:  p.tagOpts,
+		stepSize:          p.stepSize,
+		tagOpts:           p.tagOpts,
+		parseFunctionExpr: p.parseFunctionExpr,
 	}
+
 	err := state.walk(p.expr)
 	if err != nil {
 		return nil, nil, err
@@ -76,10 +82,11 @@ func (p *promParser) String() string {
 }
 
 type parseState struct {
-	stepSize   time.Duration
-	edges      parser.Edges
-	transforms parser.Nodes
-	tagOpts    models.TagOptions
+	stepSize          time.Duration
+	edges             parser.Edges
+	transforms        parser.Nodes
+	tagOpts           models.TagOptions
+	parseFunctionExpr ParseFunctionExpr
 }
 
 func (p *parseState) lastTransformID() parser.NodeID {
@@ -193,7 +200,8 @@ func (p *parseState) walk(node pql.Node) error {
 
 	case *pql.MatrixSelector:
 		// Align offset to stepSize.
-		n.Offset = adjustOffset(n.Offset, p.stepSize)
+		vectorSelector := n.VectorSelector.(*pql.VectorSelector)
+		vectorSelector.Offset = adjustOffset(vectorSelector.Offset, p.stepSize)
 		operation, err := NewSelectorFromMatrix(n, p.tagOpts)
 		if err != nil {
 			return err
@@ -203,7 +211,7 @@ func (p *parseState) walk(node pql.Node) error {
 			p.transforms,
 			parser.NewTransformFromOperation(operation, p.transformLen()),
 		)
-		return p.addLazyOffsetTransform(n.Offset)
+		return p.addLazyOffsetTransform(vectorSelector.Offset)
 
 	case *pql.VectorSelector:
 		// Align offset to stepSize.
@@ -315,8 +323,8 @@ func (p *parseState) walk(node pql.Node) error {
 			}
 		}
 
-		op, ok, err := NewFunctionExpr(n.Func.Name, argValues,
-			stringValues, hasValue, p.tagOpts)
+		op, ok, err := p.parseFunctionExpr(n.Func.Name, argValues,
+			stringValues, hasValue, n.Args.String(), p.tagOpts)
 		if err != nil {
 			return err
 		}
@@ -332,6 +340,7 @@ func (p *parseState) walk(node pql.Node) error {
 				ChildID:  opTransform.ID,
 			})
 		}
+
 		p.transforms = append(p.transforms, opTransform)
 		return nil
 
